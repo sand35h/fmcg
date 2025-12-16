@@ -1,0 +1,217 @@
+Project Brief: Supply & Demand Forecasting System for FMCG Producer
+Project Overview:
+We want to build a supply & demand forecasting system for an FMCG producer that has more than two decades of historical data. The system will combine the company’s rich internal data (sales, promotions, distribution, inventory, returns, pricing, SKUs, channel/POS data) with external signals — weather, festival/holiday calendars, macroeconomic indicators, competitor activity, geopolitical events, and other relevant drivers — to produce reliable, explainable forecasts across multiple time horizons. The primary goals are to improve forecast accuracy, reduce stockouts and overstocks, optimize inventory and replenishment, and enable scenario planning for production and logistics.
+Key Objectives:
+Build a scalable forecasting solution that leverages 20+ years of internal data plus external factors to predict demand at SKU × location granularity for short-, mid-, and long-term horizons.
+
+
+Improve operational KPIs: reduce stockouts and excess inventory, increase inventory turns, and improve in-fill/service levels via data-driven replenishment recommendations.
+
+
+Provide explainable, auditable forecasts and drivers (feature importance, anomaly detection, what-if scenarios) so business users can trust and act on outputs.
+
+
+Integrate forecasts into existing supply-chain/ERP workflows and downstream tools (order generation, production planning, distributor portals, BI dashboards).
+
+
+Deploy robust monitoring, alerting, and model-retraining pipelines so forecasts self-heal and adapt to new patterns (promotions, seasonality shifts, geopolitical shocks).
+
+
+Design for extensibility so new external data sources (satellite data, social trends, retail promotions feeds) can be added with minimal engineering effort.
+
+
+Scope & Deliverables:
+Data ingestion & storage: central data lake/warehouse that houses historical sales, master data (SKU, pack sizes), promotions, pricing, distribution logs, inventory snapshots, and external data connectors (weather API, festival calendar, macro indicators, news/event feed).
+
+
+Data quality & feature engineering: cleaning, deduplication, outlier handling, promotion labeling, lag/rolling features, holiday flags, weather features, price elasticity features.
+
+
+Modeling: ensemble approach (baseline statistical time-series + gradient-boosted trees + deep learning such as LSTM/Transformer where useful), hierarchical forecasting (store → region → national), and model selection per SKU/segment.
+
+
+Forecast products: daily/weekly/monthly demand forecasts, uncertainty intervals, bias-adjusted replenishment recommendations, promotion uplift estimates, and scenario projections (e.g., extended festival, poor weather).
+
+
+Interfaces: interactive BI dashboards (filters by SKU/location/time, driver explanations), scheduled forecast exports (CSV/API) to ERP, and alerting for data issues or demand anomalies.
+
+
+MLOps & monitoring: automated retraining pipelines, model performance tracking (MAPE, MAE, bias), drift detection, versioning, and rollback capability.
+
+
+Documentation & training: user guide for planners, model documentation (methodology, assumptions), and 2–3 training sessions for supply/planning teams.
+
+
+Success Metrics (examples):
+Forecast accuracy targets by horizon (e.g., MAPE reduction of X% vs current baseline; set per category).
+
+
+Reduction in stockouts (%) and excess inventory (%) in 6 months after launch.
+
+
+Increase in inventory turns and service level (OTIF).
+
+
+Time-to-insight: average time for planners to get actionable recommendation from dashboard.
+
+
+Model stability: frequency of retraining and improvement in backtest metrics.
+
+
+High-level Technical Architecture:
+Data layer: data lake (raw), ETL/ELT pipelines, data warehouse for analytics.
+
+
+Feature store: reusable feature engineering for real-time and batch scoring.
+
+
+Modeling layer: orchestration (Airflow or similar), training (Python + ML frameworks), model registry.
+
+
+Serving layer: forecast API, scheduled exports to ERP/WMS.
+
+
+Presentation: BI dashboards (Metabase / Power BI / Tableau) and planner UI.
+
+
+Observability: logging, monitoring, model explainability tools (SHAP/feature attribution), and anomaly detection.
+
+Project Brief: Supply & Demand Forecasting System for FMCG Producer
+
+Project Overview:
+We want to develop a supply & demand forecasting system for an FMCG producer with over two decades of historical data. The system will combine the company’s rich internal data (sales, promotions, distribution, inventory, returns, pricing, SKUs, channel/POS data) with external signals  weather, festival/holiday calendars, macroeconomic indicators, competitor activity, geopolitical events, and other relevant drivers  to produce reliable, explainable forecasts across multiple time horizons. The primary goals are to improve forecast accuracy, reduce stockouts and overstocks, optimize inventory and replenishment, and enable scenario planning for production and logistics
+
+Key Objectives: 
+    • Build a scalable forecasting solution that leverages 20+ years of internal data plus external factors to predict demand at SKU × location granularity for short-, mid-, and long-term horizons.
+    • Improve operational KPIs: reduce stockouts and excess inventory, increase inventory turns, and improve in-fill/service levels via data-driven replenishment recommendations.
+    • Provide explainable, auditable forecasts and drivers (feature importance, anomaly detection, what-if scenarios) so business users can trust and act on outputs.
+    • Integrate forecasts into existing supply-chain/ERP workflows and downstream tools (order generation, production planning, distributor portals, BI dashboards).
+    • Deploy robust monitoring, alerting, and model-retraining pipelines so forecasts self-heal and adapt to new patterns (promotions, seasonality shifts, geopolitical shocks).
+    • Design for extensibility so new external data sources (satellite data, social trends, retail promotions feeds) can be added with minimal engineering effort.
+Scope & Deliverables: 
+    • Data ingestion & storage: central data lake/warehouse that houses historical sales, master data (SKU, pack sizes), promotions, pricing, distribution logs, inventory snapshots, and external data connectors (weather API, festival calendar, macro indicators, news/event feed).
+    • Data quality & feature engineering: cleaning, deduplication, outlier handling, promotion labeling, lag/rolling features, holiday flags, weather features, price elasticity features.
+        • Forecast products: daily/weekly/monthly demand forecasts, uncertainty intervals, bias-adjusted replenishment recommendations, promotion uplift estimates, and scenario projections (e.g., extended festival, poor weather).
+    • Interfaces: interactive BI dashboards (filters by SKU/location/time), scheduled forecast exports (CSV/API) to ERP, and alerting for data issues or demand anomalies.
+    • MLOps & monitoring: automated retraining pipelines, model performance tracking, drift detection, versioning, and rollback capability.
+
+
+
+
+Ingestion & Storage
+Central data lake on Amazon S3 (raw / curated / feature zones).
+Ingest batch historical tables via AWS Glue jobs or AWS DMS (if migrating DB).
+Stream POS/near-real-time events via Amazon Kinesis Data Streams → S3 or Lambda.
+External connectors (weather, festival, macro) ingested with AWS Lambda scheduled by EventBridge.
+Catalog & Governance
+Data catalog & schema discovery with AWS Glue Data Catalog (optionally Lake Formation for access control).
+S3 bucket versioning + AWS KMS encryption & fine-grained IAM policies.
+Data Quality & Feature Engineering
+Scheduled ETL/transform in AWS Glue (PySpark) or EMR for heavy transforms.
+Feature store or feature table staging in S3 / Amazon Redshift or SageMaker Feature Store.
+Data-quality checks and anomaly flags implemented in Glue/EMR jobs (rules + CloudWatch alerts).
+Modeling & Forecasting
+Use Amazon Forecast for baseline/time-series models (fast path) and Amazon SageMaker for custom models (advanced).
+Feature pipelines in SageMaker Pipelines or Glue → store model inputs in Feature Store/S3.
+Explainability with SageMaker Clarify or SHAP via SageMaker notebooks.
+Training, Retraining & MLOps
+Automated training & retraining pipelines using SageMaker Pipelines + EventBridge triggers.
+Model registry & versioning with SageMaker Model Registry.
+Model monitoring & drift detection with SageMaker Model Monitor and CloudWatch metrics.
+CI/CD for ML code using CodeCommit / CodeBuild / CodePipeline (optional).
+Inference & Integration
+Online inference via SageMaker Real-time Endpoints or serverless inference (Lambda + API Gateway) for low concurrency.
+Batch forecast exports (CSV/Parquet) to S3 via scheduled jobs (Glue / Lambda / Batch).
+ERP/order system integration via secure API endpoints (API Gateway + Lambda) or SFTP to ERP ingestion point.
+Replenishment & Scenario Engines
+Replenishment recommendation microservice (Lambda) that consumes forecasts and business rules; outputs orders to ERP.
+Simple scenario runner (e.g., “festival + price drop”) implemented as Lambda/Step Functions that runs forecasts with alternate inputs.
+Lightweight UI
+Small web app for operations: React single-page app hosted on S3 + CloudFront.
+Auth with Amazon Cognito.
+UI pages: upload/monitor data jobs, view latest forecasts (table + CSV download), run basic what-if scenarios, view model status & retrain button.
+UI talks to backend APIs (API Gateway → Lambda → S3 / SageMaker).
+Monitoring, Alerts & Ops: Operational logs, metrics and alarms via CloudWatch + SNS notifications.
+Security & Compliance : Least-privilege IAM roles, VPC endpoints for S3 and Glue, and audit logs in CloudTrail.
+Deliverables
+S3 data lake skeleton + sample ingest jobs (Glue + Lambda).
+At least one working forecasting pipeline: (a) ingest → (b) feature prep → (c) train (Forecast or SageMaker) → (d) serve.
+Lightweight React UI with auth that can: show forecasts, trigger retrain, run a scenario, and download CSV.
+Automated retrain trigger and basic model monitor (drift alert).
+README with architecture diagram, deployment steps (IaC like CloudFormation/SAM) and runbook.
+
+
+
+1. Stakeholder Questionnaire 
+A. Business & Objectives
+What are the specific business KPIs you expect the forecasting system to improve? (e.g., reduce stockouts by X%, reduce days-of-inventory by Y).
+Which time horizons matter most operationally (daily, weekly, monthly, quarterly)?
+Which planning roles will use the forecasts (e.g., demand planners, production planners, distributors, category managers)?
+Which decisions will be automated vs. human-in-the-loop (order generation, safety stock changes, production schedule adjustments)?
+Which SKU × location aggregation levels are required (store-SKU, DC-SKU, region-SKU, national-SKU)?
+Are there hard constraints (e.g., minimum service level, shelf-life constraints, lead-times) the system must respect when recommending replenishment?
+What is the acceptable level of forecast uncertainty for operational use (confidence bands width / service-level targets)?
+B. Data Availability & Quality
+What exact historical tables exist and who owns them? (sales transactions, invoices, returns, inventory snapshots, promotions, pricing history, SKU master, store master, distribution logs)
+What is the lowest data granularity available and the typical retention (e.g., daily transactional POS for 20 years; hourly for last 2 years)?
+How complete is the historical data (estimated % missing or unreliable per table)?
+Are promotions recorded at transaction-level (coupon/price override) or only as campaign-level metadata?
+Is there a canonical SKU master with consistent identifiers across channels? Are pack-size conversions available?
+Are shipment/lead-time records available between DCs and stores and between suppliers and DCs?
+Can we pull external data: historical weather, public holiday calendars, macroeconomic indicators, trade promotions from retailers, competitor price scraping, news/event feed? Who owns access/API keys?
+C. Business Rules & Domain Knowledge
+Are there category-specific rules (e.g., perishable items, mandatory display promotions, pack size cannibalization) we must encode?
+How do promotions typically affect sales (depth and duration) — short, aggressive discounts vs. long-running price cuts?
+Are there recurrent sales patterns tied to local festivals or seasons that are not captured in standard holiday calendars?
+Who are power users for model explanations and what level of technical detail do they need?
+D. Systems, Integration & IT
+Where should the forecasting service run (on-prem data center, AWS, GCP, Azure, hybrid)?
+What existing systems must the forecasts integrate with (ERP name/version, WMS, order management)?
+What format and frequency for forecast delivery is required (API, CSV, SFTP; hourly/daily)?
+Are there network, security, or compliance constraints (VPCs, firewall rules, data residency, encryption standards)?
+Do we have an identity & access management system for role-based access to dashboard & APIs?
+E. MLOps & Monitoring
+What is the desired model retraining cadence (daily, weekly, monthly) and who approves model changes?
+Which monitoring signals are priority (data quality, feature drift, performance degradation, SLA violations)?
+What is the rollback policy if a new model degrades operations?
+Are there existing logging/observability stacks (Elastic, Prometheus, Grafana, Datadog) we must plug into?
+F. UX, Explainability & Governance
+What level of explanation is required for planners (top-5 drivers per forecast, SHAP values, counterfactuals)?
+Do planners require manual adjustment of forecasts and audit trails for changes?
+Are there audit/regulatory requirements for explainability or data retention?
+G. Budget, Timeline & People
+What is the project budget and the target launch date for an MVP?
+Who are the internal stakeholders and their commitment level (data owner, supply chain head, IT lead)?
+What internal resources are available (data engineers, ML engineers, DevOps, BI developers)?
+
+A. Business & Objectives 
+KPIs we expect this system to improve
+Right now our biggest problems are frequent stockouts of fast-moving SKUs at retail, excess stock of slow-moving items at distribution centers, and a lack of trust in our current Excel based forecasts. We want this system to clearly reduce stockouts for A and B category SKUs by at least 25 to 30 percent within six months of rollout. At the same time, we want excess inventory and dead stock reduced by around 15 percent without hurting service level. Forecast accuracy should measurably improve versus our current baseline. For weekly forecasts, we expect at least a 20 to 25 percent reduction in MAPE for top categories. If accuracy does not materially improve, the system will not be adopted.
+Time horizons that matter most
+Daily and weekly forecasts are the most critical. These drive store level and distributor replenishment decisions. Monthly forecasts are important for production planning and raw material procurement. Anything beyond quarterly is useful only for high-level scenario planning and budgeting. The system must clearly distinguish between operational forecasts and planning forecasts and not mix them.
+Who will actually use the forecasts
+Demand planners are the primary users and will interact with the system daily. Production planning teams will consume monthly and quarterly forecasts. Category managers will use the system mainly during promotion planning cycles. Distributors and field sales teams should only see simplified order proposals, not model internals. The system should not assume all users are technical. Most users will judge the system by whether it saves time and reduces firefighting.
+What should be automated vs reviewed manually
+The system should automatically generate recommended order quantities and safety stock levels for routine replenishment. Planners should only intervene when the system flags anomalies, promotions, supply constraints, or unusually high uncertainty. Production planning recommendations can be advisory only. The final authority for changing production plans stays with humans.
+Granularity expectations
+For high-volume SKUs, we expect forecasting at SKU by store or SKU by distributor level. For medium volume SKUs, SKU by region is acceptable. For long-tail SKUs, category level or pooled models are fine as long as the logic is transparent. The system should dynamically handle different granularities without hardcoding logic.
+Operational constraints the system must respect
+The system must explicitly respect lead times, minimum order quantities, pallet or truck load constraints, and shelf life where applicable. Forecasts that ignore these constraints are useless. Replenishment recommendations should never suggest quantities that cannot physically be shipped or sold before expiry.
+Uncertainty tolerance
+We understand forecasts are not perfect. What we need is visibility into risk. The system should always show confidence intervals and clearly flag high-risk forecasts. If uncertainty exceeds a predefined threshold, the system should request planner review instead of pretending precision.
+B. Data Availability & Quality 
+What data we actually have
+We have sales data from ERP and POS systems, but not all channels are equally clean. Modern trade data is fairly reliable. General trade data is noisier and often aggregated. Inventory snapshots exist but some locations skip reporting on certain days. Promotion data exists but is poorly structured historically.
+Granularity and historical depth
+Daily data is reliable for the last 10 to 12 years. Older data exists but is aggregated monthly and sometimes misses location detail. The system must handle uneven historical depth instead of assuming perfect data.
+Data quality issues to expect
+Expect missing values, duplicate records, SKU code changes over time, inconsistent unit measurements, and negative inventory adjustments. The system must include strong data validation, logging, and correction logic. Silent failures are unacceptable.
+Promotion recording reality
+Many promotions were executed without perfect documentation. Some are recorded only via marketing emails or free text fields. We want the system to infer promotional effects even when explicit flags are missing, using price drops and abnormal sales spikes.
+SKU master challenges
+SKU identifiers have changed over the years due to rebranding and pack size changes. The system must maintain a canonical SKU mapping table and track SKU lineage so historical demand is not fragmented.
+Lead time data
+Lead times are not consistently recorded. The system should estimate lead times empirically from shipment and receipt timestamps and allow planners to override defaults for exceptional cases.
+External data expectations
+Weather and holiday data must be integrated. Fes
+

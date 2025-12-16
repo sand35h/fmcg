@@ -1,0 +1,297 @@
+# FMCG Supply & Demand Forecasting System - Completed Questionnaire
+# Final Year Project Submission
+
+================================================================================
+1. STAKEHOLDER QUESTIONNAIRE
+================================================================================
+
+## A. Business & Objectives
+
+### Q1: What are the specific business KPIs you expect the forecasting system to improve?
+**Answer:**
+For this final year project demonstration, the system targets the following KPIs:
+- **Stockout Reduction**: Reduce stockouts for A and B category SKUs by 25-30% 
+- **Excess Inventory Reduction**: Reduce dead stock and excess inventory by ~15%
+- **Forecast Accuracy**: Improve MAPE (Mean Absolute Percentage Error) by 20-25% for weekly forecasts on top product categories
+- **Service Level (OTIF)**: Increase On-Time In-Full delivery metrics
+- **Inventory Turnover**: Improve inventory turns through optimized replenishment recommendations
+
+### Q2: Which time horizons matter most operationally?
+**Answer:**
+- **Daily/Weekly (Primary)**: Most critical for store-level and distributor replenishment decisions
+- **Monthly (Secondary)**: Important for production planning and raw material procurement
+- **Quarterly (Tertiary)**: Used for high-level scenario planning and budgeting only
+The system clearly distinguishes between operational forecasts (daily/weekly) and planning forecasts (monthly/quarterly).
+
+### Q3: Which planning roles will use the forecasts?
+**Answer:**
+- **Demand Planners (Primary Users)**: Interact with system daily, monitor forecasts and anomalies
+- **Production Planning Teams**: Consume monthly/quarterly forecasts for production scheduling
+- **Category Managers**: Use system during promotion planning cycles
+- **Distributors/Field Sales**: Access simplified order proposals only (not model internals)
+- **Operations Managers**: View dashboards for strategic decision-making
+
+### Q4: Which decisions will be automated vs. human-in-the-loop?
+**Answer:**
+- **Automated**: 
+  - Generate recommended order quantities
+  - Calculate safety stock levels
+  - Routine replenishment suggestions
+  - Anomaly detection and flagging
+- **Human-in-the-Loop**:
+  - Override decisions for promotions, supply constraints, or high-uncertainty periods
+  - Production planning final approval
+  - Model retraining approval
+  - Exception handling for anomalies
+
+### Q5: Which SKU × location aggregation levels are required?
+**Answer:**
+- **High-Volume SKUs**: SKU × Store or SKU × Distributor level granularity
+- **Medium-Volume SKUs**: SKU × Region level acceptable
+- **Long-Tail SKUs**: Category-level or pooled models with transparent logic
+The system dynamically handles different granularity levels without hardcoding.
+
+### Q6: Are there hard constraints the system must respect when recommending replenishment?
+**Answer:** Yes, the system explicitly respects:
+- Lead times between suppliers, DCs, and stores
+- Minimum order quantities (MOQ)
+- Pallet/truck load constraints
+- Shelf life for perishable products (DAIRY, BEVERAGES)
+- Maximum storage capacity at locations
+- Transportation scheduling windows
+
+### Q7: What is the acceptable level of forecast uncertainty for operational use?
+**Answer:**
+- System always shows confidence intervals (e.g., 80%, 95% prediction intervals)
+- High-risk forecasts (uncertainty exceeding threshold) are flagged for planner review
+- Service-level targets: 95% in-stock for A-category SKUs, 90% for B-category
+- Uncertainty visualization is mandatory for all forecast outputs
+
+---
+
+## B. Data Availability & Quality
+
+### Q8: What exact historical tables exist and who owns them?
+**Answer (Simulated for Project):**
+| Table | Description | Owner |
+|-------|-------------|-------|
+| daily_timeseries.csv | Daily sales, demand, inventory, prices | Data Engineering |
+| sku_master.csv | SKU metadata, categories, pricing | Master Data Team |
+| location_master.csv | Store/DC locations, regions | Operations |
+| festival_calendar.csv | Festival/holiday dates | Business Analytics |
+| monthly_macro.csv | Macroeconomic indicators | External Data Team |
+
+### Q9: What is the lowest data granularity and retention?
+**Answer:**
+- Daily data reliable for 10+ years (synthetic dataset simulates 10 years: 2006-2015)
+- Older data exists but may be aggregated monthly
+- Granularity: SKU × Location × Day level with channel breakdown
+- System handles uneven historical depth appropriately
+
+### Q10: How complete is the historical data?
+**Answer:**
+Expected data quality issues (handled by the system):
+- Missing values (~5-10% in some tables)
+- Duplicate records requiring deduplication
+- SKU code changes over time (rebranding)
+- Inconsistent unit measurements
+- Negative inventory adjustments
+Strong data validation, logging, and correction logic implemented.
+
+### Q11: Are promotions recorded at transaction-level or campaign-level?
+**Answer:**
+Historical promotions may be poorly documented. System designed to:
+- Use explicit promo_flag when available
+- Infer promotional effects from price drops and abnormal sales spikes
+- Support both campaign-level and transaction-level promotion data
+
+### Q12: Is there a canonical SKU master with consistent identifiers?
+**Answer:**
+- SKU master maintains canonical identifiers
+- System tracks SKU lineage for rebranding and pack size changes
+- Pack-size conversions available in master data
+- Concept drift simulation includes SKU rebranding every 5 years
+
+### Q13: Are shipment/lead-time records available?
+**Answer:**
+Lead times estimated empirically from shipment/receipt timestamps. 
+Planners can override defaults for exceptional cases.
+Default lead times by region and supplier stored in configuration.
+
+### Q14: Can we pull external data?
+**Answer:** Yes, the system integrates:
+- **Weather Data**: Historical and forecast weather (API integration)
+- **Festival/Holiday Calendar**: Nepal-specific and standard holidays
+- **Macroeconomic Indicators**: GDP growth, CPI, consumer confidence
+- **Competitor Activity**: Price monitoring and promo detection (optional)
+
+---
+
+## C. Business Rules & Domain Knowledge
+
+### Q15: Are there category-specific rules we must encode?
+**Answer:** Yes:
+- **Perishables (DAIRY)**: 14-day shelf life, 5-15% daily spoilage factor
+- **Semi-Perishables**: 90-day shelf life
+- **Stable Products**: 365-day shelf life
+- Pack size cannibalization effects
+- Mandatory display promotion rules
+
+### Q16: How do promotions typically affect sales?
+**Answer:**
+- Short aggressive discounts: 25-50% off for 3-14 days
+- Long-running price cuts: Gradual effect on demand
+- Promo depth affects price elasticity (simulated in dataset)
+- Festival periods: 10-80% sales uplift within ±3 days of festival
+
+### Q17: Are there recurrent patterns tied to local festivals?
+**Answer:** Yes, Nepal-specific festivals captured:
+- Dashain (October)
+- Tihar/Deepawali (October-November)
+- Holi (March)
+- New Year celebrations (January, April)
+- Major religious festivals
+
+### Q18: Who are power users for model explanations?
+**Answer:**
+- Demand planners need top-5 drivers per forecast explanation
+- Category managers want promotion uplift analysis
+- Operations managers need high-level dashboard summaries
+- Technical users may access SHAP values and feature importance
+
+---
+
+## D. Systems, Integration & IT
+
+### Q19: Where should the forecasting service run?
+**Answer:** AWS Cloud (as specified in architecture):
+- S3 for data lake storage
+- AWS Glue for ETL
+- Amazon Forecast/SageMaker for ML
+- Lambda for serverless functions
+- API Gateway for REST APIs
+- CloudFront for frontend hosting
+
+### Q20: What existing systems must forecasts integrate with?
+**Answer:**
+- ERP system (via API/CSV export)
+- Warehouse Management System (WMS)
+- Order Management System
+- Distributor portals
+- BI dashboards (Metabase/Power BI/Tableau)
+
+### Q21: What format and frequency for forecast delivery?
+**Answer:**
+- **Format**: JSON via REST API, CSV/Parquet exports to S3
+- **Frequency**: Daily batch exports, real-time API for on-demand queries
+- **Integration**: API Gateway → Lambda → S3/SageMaker endpoint
+
+### Q22: Network, security, or compliance constraints?
+**Answer:**
+- VPC endpoints for internal services
+- AWS KMS encryption for data at rest
+- IAM least-privilege policies
+- CloudTrail audit logs
+- HTTPS/TLS for all API communications
+
+### Q23: Identity & access management system?
+**Answer:**
+Amazon Cognito for user authentication with role-based access:
+- Admin: Full system access, model management
+- Planner: Forecast viewing, override capabilities
+- Viewer: Dashboard read-only access
+
+---
+
+## E. MLOps & Monitoring
+
+### Q24: What is the desired model retraining cadence?
+**Answer:**
+- **Automated Retraining**: Weekly with new data
+- **Manual Trigger**: UI button for on-demand retraining
+- **Approval**: Auto-deploy if performance metrics improve; human approval for degraded metrics
+- **Pipeline**: SageMaker Pipelines + EventBridge scheduled triggers
+
+### Q25: Which monitoring signals are priority?
+**Answer (Priority Order):**
+1. Forecast performance degradation (MAPE, MAE increase)
+2. Data quality issues (missing data, schema changes)
+3. Feature drift detection
+4. SLA violations (latency, availability)
+5. Anomaly alerts for unusual demand patterns
+
+### Q26: What is the rollback policy if a new model degrades operations?
+**Answer:**
+- SageMaker Model Registry maintains version history
+- Automatic rollback to previous version if MAPE increases >10%
+- Manual rollback available via UI
+- Rollback completed within 15 minutes
+
+### Q27: Are there existing logging/observability stacks?
+**Answer:**
+AWS-native observability:
+- CloudWatch for metrics and logs
+- CloudWatch Alarms + SNS for notifications
+- X-Ray for API tracing (optional)
+- SageMaker Model Monitor for drift detection
+
+---
+
+## F. UX, Explainability & Governance
+
+### Q28: What level of explanation is required for planners?
+**Answer:**
+- Top-5 driver features per forecast with impact percentages
+- SHAP values for model transparency (SageMaker Clarify)
+- Visual feature importance charts
+- What-if scenario results with explained differences
+
+### Q29: Do planners require manual adjustment and audit trails?
+**Answer:**
+- Yes, planners can manually override forecasts
+- All adjustments logged with user, timestamp, reason
+- Audit trail exportable for compliance
+- Comparison view: Original forecast vs. Adjusted
+
+### Q30: Audit/regulatory requirements for explainability or data retention?
+**Answer:**
+- Model predictions logged for 2+ years
+- Forecast rationale stored for audit purposes
+- CloudTrail for all API access logs
+- S3 bucket versioning for data lineage
+
+---
+
+## G. Budget, Timeline & People (Final Year Project Context)
+
+### Q31: What is the project budget and target launch date for MVP?
+**Answer (Academic Context):**
+- **Budget**: Academic project (no monetary budget; AWS Free Tier + student credits)
+- **Timeline**: One semester (~4 months)
+- **MVP Scope**: 
+  - Synthetic data pipeline
+  - Working forecasting pipeline (ingest → feature → train → serve)
+  - React UI with auth, forecast display, scenario planning
+  - Basic model monitoring and retrain capability
+
+### Q32: Who are the internal stakeholders?
+**Answer (Final Year Project):**
+- **Project Supervisor**: Academic guidance and approval
+- **Student Team**: Development and implementation
+- **Peer Reviewers**: Testing and feedback
+
+### Q33: What internal resources are available?
+**Answer:**
+- 1-2 students with Python/React development skills
+- Access to AWS student credits
+- University computing resources
+- Online documentation and tutorials
+
+================================================================================
+END OF QUESTIONNAIRE
+================================================================================
+
+Note: This questionnaire has been completed in the context of a Final Year Project
+demonstrating an FMCG Supply & Demand Forecasting System. Answers reflect a 
+realistic simulation of enterprise requirements while remaining achievable within 
+academic project constraints.
