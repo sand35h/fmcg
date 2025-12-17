@@ -29,7 +29,6 @@ import sys
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
@@ -38,11 +37,6 @@ try:
     import lightgbm
 except ImportError:
     lightgbm = None
-
-try:
-    import catboost
-except ImportError:
-    catboost = None
 
 # Optional imports for visualization
 try:
@@ -132,18 +126,18 @@ def reduce_mem_usage(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
 class DataConfig:
     """Configuration for data paths and columns."""
 
-    data_root: Path = Path("/kaggle/input/fmcg-dataset")
-    output_root: Path = Path("./output")
+    data_root: Path = Path("/kaggle/input" if Path("/kaggle/input").exists() else "./data")
+    output_root: Path = Path("/kaggle/working" if Path("/kaggle/working").exists() else "./output")
 
     # File names
-    sku_file: str = "sku_master (1).csv"
-    location_file: str = "location_master (1).csv"
-    festival_file: str = "festival_calendar (1).csv"
-    macro_file: str = "monthly_macro (1).csv"
-    daily_ts_file: str = "daily_timeseries (1).csv"
-    shipment_file: str = "shipment_data.csv"
-    competitor_file: str = "competitor_activity.csv"
-    weather_file: str = "weather_data.csv"
+    sku_file: str = "sku_master.parquet"
+    location_file: str = "location_master.parquet"
+    festival_file: str = "festival_calendar.parquet"
+    macro_file: str = "macro_indicators.parquet"
+    daily_ts_file: str = "daily_timeseries.parquet"
+    shock_file: str = "external_shocks.parquet"
+    competitor_file: str = "competitor_activity.parquet"
+    weather_file: str = "weather_data.parquet"
 
     # Column definitions
     target_col: str = "actual_demand"
@@ -184,10 +178,11 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """Configuration for XGBoost model parameters."""
+    """Configuration for LightGBM model parameters."""
 
-    n_estimators: int = 500
-    max_depth: int = 8
+    n_estimators: int = 3000
+    max_depth: int = 12
+    num_leaves: int = 128
     learning_rate: float = 0.05
     subsample: float = 0.8
     colsample_bytree: float = 0.8
@@ -215,15 +210,73 @@ class TrainingConfig:
     use_cv: bool = False  # Whether to use cross-validation
 
     # Experiment tracking
-    experiment_name: str = "fmcg_xgb"
+    experiment_name: str = "fmcg_lgb"
     save_predictions: bool = True
     save_feature_importance: bool = True
 
 
 # =============================================================================
-# METRICS
+# UTILITIES
 # =============================================================================
 
+def reduce_mem_usage(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Iterate through all columns of a dataframe and modify the data type
+    to reduce memory usage. Double precision -> Single precision.
+    """
+    start_mem = df.memory_usage().sum() / 1024**2
+    
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        if 'datetime' in str(col_type) or 'timedelta' in str(col_type):
+            continue
+
+        if col_type != object and col_type.name != 'category':
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)  
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float32) # float16 is sometimes unstable
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        else:
+            # Convert object to category for high cardinality savings
+            if df[col].nunique() / len(df) < 0.5: # If unique values are < 50% of rows
+                df[col] = df[col].astype('category')
+
+    end_mem = df.memory_usage().sum() / 1024**2
+    if verbose:
+        logger.info(f'Mem. usage decreased to {end_mem:.2f} Mb ({100 * (start_mem - end_mem) / start_mem:.1f}% reduction)')
+    
+    return df
+
+
+def clean_data_for_training(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """Remove inf and extreme values from features."""
+    for col in feature_cols:
+        if col in df.columns:
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+            if df[col].isna().any():
+                median_val = df[col].median()
+                df[col] = df[col].fillna(0 if np.isnan(median_val) else median_val)
+    return df
+
+
+# =============================================================================
+# METRICS
+# =============================================================================
 
 class Metrics:
     """Calculate and store forecasting metrics."""
@@ -263,12 +316,17 @@ class Metrics:
             )
         )
 
-        # Weighted MAPE (weighted by actual values)
+        # Weighted MAPE (weighted by actual values) - Primary Metric
+        # Handles zeros well and weights high-volume items more
         wmape = np.sum(np.abs(y_true - y_pred)) / np.maximum(np.sum(np.abs(y_true)), 1) * 100
 
         # Bias (positive = over-forecasting)
         bias = np.mean(y_pred - y_true)
         bias_pct = bias / np.maximum(np.mean(y_true), 1) * 100
+        
+        # Service Level (approximate)
+        # Percentage of time prediction >= actual
+        service_level = np.mean(y_pred >= y_true) * 100
 
         metrics = {
             f"{prefix}mae": mae,
@@ -279,23 +337,40 @@ class Metrics:
             f"{prefix}wmape": wmape,
             f"{prefix}bias": bias,
             f"{prefix}bias_pct": bias_pct,
+            f"{prefix}service_level": service_level,
         }
+
+        # Format for logging
+        metrics_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        # logger.debug(f"Metrics ({prefix.strip('_')}): {metrics_str}")
 
         return metrics
 
+
     @staticmethod
     def log_metrics(metrics: Dict[str, float], name: str = "") -> None:
-        """Log metrics in a formatted way."""
+        """Log metrics in a formatted way (flexible key lookup)."""
         logger.info(f"\n{'=' * 50}")
         logger.info(f"{name} METRICS")
         logger.info(f"{'=' * 50}")
-        logger.info(f"MAE   : {metrics.get(f'{name.lower()}_mae', 0):,.3f}")
-        logger.info(f"RMSE  : {metrics.get(f'{name.lower()}_rmse', 0):,.3f}")
-        logger.info(f"R²    : {metrics.get(f'{name.lower()}_r2', 0):.4f}")
-        logger.info(f"MAPE  : {metrics.get(f'{name.lower()}_mape', 0):.2f}%")
-        logger.info(f"SMAPE : {metrics.get(f'{name.lower()}_smape', 0):.2f}%")
-        logger.info(f"WMAPE : {metrics.get(f'{name.lower()}_wmape', 0):.2f}%")
-        logger.info(f"Bias  : {metrics.get(f'{name.lower()}_bias_pct', 0):+.2f}%")
+        
+        # Helper to find key for a metric suffix
+        def get_val(suffix: str) -> float:
+            # 1. Try exact match (e.g. "mae")
+            if suffix in metrics: return metrics[suffix]
+            # 2. Try prefix match (e.g. "val_mae")
+            for k in metrics:
+                if k.endswith(f"_{suffix}"): return metrics[k]
+                if k.endswith(suffix): return metrics[k]
+            return 0.0
+
+        logger.info(f"MAE   : {get_val('mae'):,.3f}")
+        logger.info(f"RMSE  : {get_val('rmse'):,.3f}")
+        logger.info(f"R²    : {get_val('r2'):.4f}")
+        logger.info(f"MAPE  : {get_val('mape'):.2f}%")
+        logger.info(f"SMAPE : {get_val('smape'):.2f}%")
+        logger.info(f"WMAPE : {get_val('wmape'):.2f}%")
+        logger.info(f"Bias  : {get_val('bias_pct'):+.2f}%")
 
 
 # =============================================================================
@@ -314,34 +389,45 @@ class FeatureEngineer:
         self._macro_df: Optional[pd.DataFrame] = None
 
     def load_reference_data(self) -> None:
-        """Load reference/lookup tables."""
+        """Load reference/lookup tables with memory optimization."""
         root = self.config.data_root
+        
+        def load_smart(filename: str, desc: str) -> Optional[pd.DataFrame]:
+            """Helper to load csv or parquet with memory reduction."""
+            path = root / filename
+            if not path.exists():
+                logger.warning(f"{desc} not found at {path}")
+                return None
+            try:
+                if path.suffix == '.parquet':
+                    df = pd.read_parquet(path)
+                else:
+                    df = pd.read_csv(path)
+                
+                # Immediate optimization
+                df = reduce_mem_usage(df, verbose=False)
+                logger.info(f"Loaded {desc}: {len(df)} records")
+                return df
+            except Exception as e:
+                logger.error(f"Error loading {desc}: {e}")
+                return None
 
-        try:
-            self._sku_df = pd.read_csv(root / self.config.sku_file)
-            logger.info(f"Loaded SKU master: {len(self._sku_df)} records")
-        except FileNotFoundError:
-            logger.warning("SKU master file not found, skipping SKU features")
-
-        try:
-            self._location_df = pd.read_csv(root / self.config.location_file)
-            logger.info(f"Loaded Location master: {len(self._location_df)} records")
-        except FileNotFoundError:
-            logger.warning("Location master file not found, skipping location features")
-
-        try:
-            self._festival_df = pd.read_csv(
-                root / self.config.festival_file, parse_dates=["date"]
-            )
-            logger.info(f"Loaded Festival calendar: {len(self._festival_df)} records")
-        except FileNotFoundError:
-            logger.warning("Festival calendar not found, skipping festival features")
-
-        try:
-            self._macro_df = pd.read_csv(root / self.config.macro_file)
-            logger.info(f"Loaded Macro data: {len(self._macro_df)} records")
-        except FileNotFoundError:
-            logger.warning("Macro data not found, skipping macro features")
+        # Load all masters
+        self._sku_df = load_smart(self.config.sku_file, "SKU Master")
+        self._location_df = load_smart(self.config.location_file, "Location Master")
+        self._festival_df = load_smart(self.config.festival_file, "Festival Calendar")
+        self._macro_df = load_smart(self.config.macro_file, "Macro Indicators")
+        self._shock_df = load_smart(self.config.shock_file, "External Shocks")
+        self._weather_df = load_smart(self.config.weather_file, "Weather Data")
+        self._competitor_df = load_smart(self.config.competitor_file, "Competitor Activity")
+        
+        # Ensure date columns are datetime
+        if self._festival_df is not None and "date" in self._festival_df.columns:
+            self._festival_df["date"] = pd.to_datetime(self._festival_df["date"])
+            
+        if self._shock_df is not None:
+             if "start" in self._shock_df.columns: self._shock_df["start"] = pd.to_datetime(self._shock_df["start"])
+             if "end" in self._shock_df.columns: self._shock_df["end"] = pd.to_datetime(self._shock_df["end"])
 
     def add_sku_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add SKU master features."""
@@ -389,29 +475,137 @@ class FeatureEngineer:
 
         return out
 
+    def add_shock_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add external shock features."""
+        if self._shock_df is None or "date" not in df.columns:
+            return df
+        
+        df["is_shock_event"] = np.int8(0)
+        
+        # Add binary flags for major shock types
+        for _, row in self._shock_df.iterrows():
+            mask = (df["date"] >= row["start"]) & (df["date"] <= row["end"])
+            if mask.any():
+                df.loc[mask, "is_shock_event"] = np.int8(1)
+        
+        return df
+
     def add_macro_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add macroeconomic features."""
+        """Add macroeconomic indicators."""
         if self._macro_df is None or "date" not in df.columns:
             return df
+        
+        macro = self._macro_df.copy()
+        if "month" in macro.columns:
+            macro["month"] = pd.to_datetime(macro["month"])
+            macro["_year"] = macro["month"].dt.year
+            macro["_month"] = macro["month"].dt.month
+            
+            # Select columns to merge
+            cols = ["_year", "_month", "gdp_growth", "cpi_index", "consumer_confidence"]
+            merge_cols = [c for c in cols if c in macro.columns]
+            
+            # Perform efficient merge via temp columns
+            temp_date = pd.DataFrame({'date': df['date'].unique()})
+            temp_date['_year'] = temp_date['date'].dt.year
+            temp_date['_month'] = temp_date['date'].dt.month
+            
+            macro_feats = temp_date.merge(macro[merge_cols], on=["_year", "_month"], how="left")
+            macro_feats.drop(columns=["_year", "_month"], inplace=True)
+            
+            out = df.merge(macro_feats, on="date", how="left")
+            return out
+            
+        return df
 
-        tmp = df.copy()
-        tmp["month_key"] = tmp["date"].dt.to_period("M").dt.to_timestamp()
+    def add_weather_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add weather features."""
+        if self._weather_df is None or "date" not in df.columns:
+            return df
+        
+        weather = self._weather_df.copy()
+        weather_cols = ["avg_temp_c", "min_temp_c", "max_temp_c", "precipitation_mm", "avg_humidity_pct", "wind_speed_kmh"]
+        merge_cols = ["date"] + [c for c in weather_cols if c in weather.columns]
+        
+        out = df.merge(weather[merge_cols], on="date", how="left")
+        return out
 
-        macro_tmp = self._macro_df.copy()
-        macro_tmp["month_key"] = (
-            pd.to_datetime(macro_tmp["month"]).dt.to_period("M").dt.to_timestamp()
+    def add_competitor_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add competitor activity features."""
+        if self._competitor_df is None or "date" not in df.columns:
+            return df
+        
+        comp = self._competitor_df.copy()
+        comp_cols = ["competitor_promo_intensity", "competitor_price_pressure"]
+        merge_cols = ["date"] + [c for c in comp_cols if c in comp.columns]
+        
+        out = df.merge(comp[merge_cols], on="date", how="left")
+        
+        # Create derived features
+        if "base_price" in out.columns and "competitor_price_pressure" in out.columns:
+            out["price_ratio"] = out["price"] / (out["base_price"] * out["competitor_price_pressure"])
+        
+        return out
+
+    def add_price_elasticity_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate price elasticity using rolling correlation."""
+        if not {"price", "actual_demand"}.issubset(df.columns):
+            return df
+        
+        logger.info("Calculating price elasticity features...")
+        
+        # CRITICAL: Sort once before operations
+        df = df.sort_values(["sku_id", "location_id", "date"])
+        
+        # Calculate log price and log demand
+        df["log_price"] = np.log(df["price"] + 0.01)
+        df["log_demand"] = np.log(df["actual_demand"] + 1)
+        
+        # Create groupby once
+        g = df.groupby(["sku_id", "location_id"], observed=True)
+        
+        # Fixed rolling correlation: calculate cross-correlation between price and demand
+        def rolling_corr(group):
+            corr_matrix = group[["log_price", "log_demand"]].rolling(30, min_periods=10).corr()
+            result = corr_matrix.unstack()["log_price"]["log_demand"]
+            # Replace inf/-inf with NaN for proper handling
+            return result.replace([np.inf, -np.inf], np.nan)
+        
+        df["price_elasticity"] = g.apply(rolling_corr, include_groups=False).reset_index(level=[0,1], drop=True).values
+        
+        # Create elasticity categories (handle NaN and clip extreme values)
+        df["price_elasticity"] = df["price_elasticity"].clip(-5, 5)  # Clip extreme values
+        df["elasticity_category"] = pd.cut(
+            df["price_elasticity"],
+            bins=[-np.inf, -0.7, -0.3, 0.3, np.inf],
+            labels=["Elastic", "Moderate", "Inelastic", "Positive"]
         )
-        macro_tmp = macro_tmp.drop_duplicates(subset=["month_key"])
+        
+        # Clean up
+        df = df.drop(columns=["log_price", "log_demand"])
+        
+        return df
 
-        # Select available macro columns
-        macro_cols = ["month_key"]
-        for col in ["gdp_growth", "cpi_index", "consumer_confidence"]:
-            if col in macro_tmp.columns:
-                macro_cols.append(col)
-
-        if len(macro_cols) > 1:
-            out = tmp.merge(macro_tmp[macro_cols], on="month_key", how="left")
-            return out.drop(columns=["month_key"])
+    def add_lifecycle_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add Product Lifecycle features."""
+        if "birth_date" not in df.columns:
+            # Maybe it wasn't loaded or merge failed
+            return df
+            
+        # Ensure datetime
+        if not pd.api.types.is_datetime64_any_dtype(df["birth_date"]):
+            df["birth_date"] = pd.to_datetime(df["birth_date"], errors="coerce")
+            
+        # Days since launch
+        # Use simple subtraction. 
+        # Note: This might create negative values for pre-launch data if any exists (which shouldn't for sales data)
+        # But robust handling:
+        days = (df["date"] - df["birth_date"]).dt.days
+        df["days_since_launch"] = days.fillna(0).clip(lower=0) 
+        
+        # Optimize dtype
+        df["days_since_launch"] = df["days_since_launch"].astype(np.int16)
+        
         return df
 
     def add_calendar_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -471,49 +665,33 @@ class FeatureEngineer:
             
         logger.info(f"Generating lag features for target: {target}")
 
-        # Ensure sorted for correct shifts
+        # CRITICAL: Sort once before all operations
         df = df.sort_values(["sku_id", "location_id", "date"])
         
-        # Calculate lags one by one to keep memory peak low
+        # Create groupby once (performance optimization)
+        g = df.groupby(["sku_id", "location_id"], observed=True)
+        
+        # Calculate lags
         for lag in [1, 7, 14, 30]:
             col_name = f"demand_lag_{lag}"
             logger.info(f"Creating {col_name}...")
-            # Assign directly to avoid intermediate series copy if possible
-            df[col_name] = df.groupby(["sku_id", "location_id"])[target].shift(lag)
-            
-            # Immediate downcast
-            if df[col_name].dtype == 'float64':
-                df[col_name] = df[col_name].astype(np.float32)
-                
+            df[col_name] = g[target].shift(lag).astype(np.float32)
             gc.collect()
 
-        # Calculate rolling features one by one
-        for window in [7, 14, 30]:
+        # Calculate rolling features (FMCG-optimized windows: 14, 28)
+        for window in [14, 28]:
             # Rolling Mean
             col_mean = f"demand_rolling_{window}_mean"
             logger.info(f"Creating {col_mean}...")
-            
-            # Using transform to keep dimensions aligned
-            df[col_mean] = (
-                df.groupby(["sku_id", "location_id"])[target]
-                .shift(1)
-                .rolling(window, min_periods=1)
-                .mean()
-                .astype(np.float32) # Cast immediately
-            )
+            df[col_mean] = g[target].shift(1).rolling(window, min_periods=1).mean().astype(np.float32)
             gc.collect()
             
-            # Rolling Std
-            col_std = f"demand_rolling_{window}_std"
-            logger.info(f"Creating {col_std}...")
-            
-            df[col_std] = (
-                df.groupby(["sku_id", "location_id"])[target]
-                .shift(1)
-                .rolling(window, min_periods=1)
-                .std()
-                .astype(np.float32) # Cast immediately
-            )
+            # Coefficient of Variation (better than raw std for FMCG)
+            col_cv = f"demand_rolling_{window}_cv"
+            logger.info(f"Creating {col_cv}...")
+            rolling_mean = g[target].shift(1).rolling(window, min_periods=1).mean()
+            rolling_std = g[target].shift(1).rolling(window, min_periods=1).std()
+            df[col_cv] = (rolling_std / (rolling_mean + 1e-6)).astype(np.float32)
             gc.collect()
 
         return df
@@ -540,6 +718,30 @@ class FeatureEngineer:
         df = reduce_mem_usage(df)
         gc.collect()
 
+        # 3.1 Shock Features
+        logger.info("Adding Shock features...")
+        df = self.add_shock_features(df)
+        df = reduce_mem_usage(df)
+        gc.collect()
+
+        # 3.2 Weather Features
+        logger.info("Adding Weather features...")
+        df = self.add_weather_features(df)
+        df = reduce_mem_usage(df)
+        gc.collect()
+
+        # 3.3 Competitor Features
+        logger.info("Adding Competitor features...")
+        df = self.add_competitor_features(df)
+        df = reduce_mem_usage(df)
+        gc.collect()
+
+        # 3.4 Lifecycle Features
+        logger.info("Adding Lifecycle features...")
+        df = self.add_lifecycle_features(df)
+        df = reduce_mem_usage(df)
+        gc.collect()
+
         # 4. Macro Features
         logger.info("Adding Macro features...")
         df = self.add_macro_features(df)
@@ -558,7 +760,13 @@ class FeatureEngineer:
         df = reduce_mem_usage(df)
         gc.collect()
 
-        # 7. Lag Features (Most memory intensive)
+        # 7. Price Elasticity Features
+        logger.info("Adding Price Elasticity features...")
+        df = self.add_price_elasticity_features(df)
+        df = reduce_mem_usage(df)
+        gc.collect()
+
+        # 8. Lag Features (Most memory intensive)
         logger.info("Adding Lag features...")
         df = self.add_lag_features(df, create_new=True)
         # Note: add_lag_features already does internal GC/optimization now
@@ -585,6 +793,23 @@ class FeatureEngineer:
         result = reduce_mem_usage(result)
         gc.collect()
         
+        # Verify elasticity features were added
+        if "price_elasticity" in result.columns:
+            valid_elasticity = result["price_elasticity"].dropna()
+            if len(valid_elasticity) > 0:
+                logger.info(f"✅ Price Elasticity: {len(valid_elasticity)} valid calculations")
+                elastic_pct = (result["elasticity_category"] == "Elastic").sum() / len(result) * 100
+                logger.info(f"📊 {elastic_pct:.1f}% of products are price elastic")
+        
+        # Feature diagnostics
+        logger.info("\n=== FEATURE DIAGNOSTICS ===")
+        if "price_elasticity" in result.columns:
+            logger.info(f"Price elasticity - Non-null: {result['price_elasticity'].notna().sum()}")
+            logger.info(f"Price elasticity - Mean: {result['price_elasticity'].mean():.4f}")
+            logger.info(f"Price elasticity - Std: {result['price_elasticity'].std():.4f}")
+        if "elasticity_category" in result.columns:
+            logger.info(f"Elasticity categories:\n{result['elasticity_category'].value_counts()}")
+        
         return result
 
     def _clean_merge_columns(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -609,7 +834,7 @@ class FeatureEngineer:
 
 class FMCGTrainer:
     """
-    XGBoost trainer for FMCG demand forecasting.
+    LightGBM trainer for FMCG demand forecasting.
 
     Features:
     - Automatic GPU/CPU detection
@@ -629,7 +854,7 @@ class FMCGTrainer:
         self.model_config = model_config or ModelConfig()
         self.training_config = training_config or TrainingConfig()
 
-        self.model: Optional[xgb.XGBRegressor] = None
+        self.model: Optional[Any] = None
         self.feature_cols: List[str] = []
         self.feature_importance: Optional[pd.DataFrame] = None
         self.metrics_history: Dict[str, Dict[str, float]] = {}
@@ -642,45 +867,33 @@ class FMCGTrainer:
 
     def _detect_device(self) -> Tuple[str, str]:
         """Detect best available device (GPU or CPU)."""
+        # LightGBM uses 'cpu' or 'gpu' (not 'cuda')
         if self.model_config.use_gpu is False:
             logger.info("GPU disabled by config, using CPU")
             return "hist", "cpu"
 
-        try:
-            # Try to detect CUDA availability
-            import subprocess
-
-            result = subprocess.run(
-                ["nvidia-smi"], capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                logger.info("GPU detected, using CUDA acceleration")
-                return "hist", "cuda"
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        logger.info("No GPU detected, using CPU")
+        # For LightGBM, always use CPU to avoid CUDA compilation issues
+        logger.info("Using CPU for LightGBM")
         return "hist", "cpu"
 
     def _get_model_params(self) -> Dict[str, Any]:
-        """Build XGBoost parameters dict."""
-        tree_method, device = self._detect_device()
+        """Build LightGBM parameters dict."""
+        _, device = self._detect_device()
 
         params = {
             "n_estimators": self.model_config.n_estimators,
             "max_depth": self.model_config.max_depth,
+            "num_leaves": self.model_config.num_leaves,
             "learning_rate": self.model_config.learning_rate,
             "subsample": self.model_config.subsample,
             "colsample_bytree": self.model_config.colsample_bytree,
             "reg_lambda": self.model_config.reg_lambda,
             "reg_alpha": self.model_config.reg_alpha,
             "min_child_weight": self.model_config.min_child_weight,
-            "gamma": self.model_config.gamma,
-            "objective": "reg:squarederror",
             "random_state": self.model_config.random_state,
             "n_jobs": -1,
-            "tree_method": tree_method,
             "device": device,
+            "verbose": -1,
         }
 
         return params
@@ -726,15 +939,18 @@ class FMCGTrainer:
         logger.info("Creating Test set...")
         test_df = df.loc[test_mask].copy()
         test_df = reduce_mem_usage(test_df)
+        test_df = clean_data_for_training(test_df, self.feature_cols)
         
         logger.info("Creating Validation set...")
         val_df = df.loc[val_mask].copy()
         val_df = reduce_mem_usage(val_df)
+        val_df = clean_data_for_training(val_df, self.feature_cols)
         
         logger.info("Creating Train set...")
         # For training set, we can assign without copy if possible, or just copy and delete df immediately
         train_df = df.loc[train_mask].copy()
         train_df = reduce_mem_usage(train_df)
+        train_df = clean_data_for_training(train_df, self.feature_cols)
         
         logger.info(f"Train: {len(train_df):,} rows")
         logger.info(f"Val:   {len(val_df):,} rows")
@@ -779,7 +995,7 @@ class FMCGTrainer:
         feature_cols: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """
-        Train the XGBoost model.
+        Train the LightGBM model.
 
         Args:
             df: Prepared dataframe with features
@@ -788,6 +1004,10 @@ class FMCGTrainer:
         Returns:
             Dictionary of training and test metrics
         """
+        if lightgbm is None:
+            raise ImportError("LightGBM not installed. Run: pip install lightgbm")
+        import lightgbm as lgb
+
         logger.info("=" * 60)
         logger.info("STARTING TRAINING")
         logger.info("=" * 60)
@@ -815,19 +1035,20 @@ class FMCGTrainer:
 
         # Initialize model
         params = self._get_model_params()
-        self.model = xgb.XGBRegressor(**params)
+        self.model = lgb.LGBMRegressor(**params)
 
         # Train with early stopping on validation set
-        logger.info("Training XGBoost model...")
+        logger.info("Training LightGBM model...")
+        callbacks = [lgb.early_stopping(self.model_config.early_stopping_rounds, verbose=False)]
         self.model.fit(
             X_train,
             y_train,
             eval_set=[(X_val, y_val)],
-            verbose=100,  # Log every 100 rounds
+            callbacks=callbacks,
         )
 
         # Get best iteration
-        best_iter = self.model.best_iteration
+        best_iter = self.model.best_iteration_
         if best_iter:
             logger.info(f"Best iteration: {best_iter}")
 
@@ -876,6 +1097,10 @@ class FMCGTrainer:
         Returns:
             Average metrics across folds
         """
+        if lightgbm is None:
+            raise ImportError("LightGBM not installed. Run: pip install lightgbm")
+        import lightgbm as lgb
+
         logger.info("=" * 60)
         logger.info("STARTING CROSS-VALIDATION TRAINING")
         logger.info("=" * 60)
@@ -908,8 +1133,8 @@ class FMCGTrainer:
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-            model = xgb.XGBRegressor(**params)
-            model.fit(X_train, y_train, verbose=False)
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X_train, y_train)
 
             y_pred = np.maximum(model.predict(X_test), 0)
             metrics = Metrics.calculate(y_test, y_pred, f"fold{fold}_")
@@ -934,8 +1159,8 @@ class FMCGTrainer:
         logger.info(f"MAPE: {avg_metrics['cv_avg_mape']:.2f}% ± {avg_metrics['cv_std_mape']:.2f}%")
 
         # Train final model on all data (except holdout)
-        self.model = xgb.XGBRegressor(**params)
-        self.model.fit(X, y, verbose=False)
+        self.model = lgb.LGBMRegressor(**params)
+        self.model.fit(X, y)
 
         self.feature_importance = pd.DataFrame(
             {"feature": self.feature_cols, "importance": self.model.feature_importances_}
@@ -978,8 +1203,8 @@ class FMCGTrainer:
         out_dir = self.data_config.output_root
 
         # Save model
-        model_path = out_dir / f"{exp_name}_model_{timestamp}.json"
-        self.model.save_model(model_path)
+        model_path = out_dir / f"{exp_name}_model_{timestamp}.txt"
+        self.model.booster_.save_model(str(model_path))
         logger.info(f"Saved model to {model_path}")
 
         # Save metrics
@@ -1009,13 +1234,15 @@ class FMCGTrainer:
         """Save trained model to file."""
         if self.model is None:
             raise ValueError("No model to save. Train first.")
-        self.model.save_model(str(path))
+        self.model.booster_.save_model(str(path))
         logger.info(f"Model saved to {path}")
 
     def load_model(self, path: Union[str, Path]) -> None:
         """Load model from file."""
-        self.model = xgb.XGBRegressor()
-        self.model.load_model(str(path))
+        if lightgbm is None:
+            raise ImportError("LightGBM not installed. Run: pip install lightgbm")
+        import lightgbm as lgb
+        self.model = lgb.Booster(model_file=str(path))
         logger.info(f"Model loaded from {path}")
 
 
@@ -1067,10 +1294,11 @@ class ForecastVisualizer:
             save: Whether to save the plot
             show: Whether to display the plot
         """
-        if plt is None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
             logger.warning("matplotlib not installed. Cannot generate plots.")
             return
-        import matplotlib.pyplot as plt
         
         top_features = feature_importance.head(top_n)
         
@@ -1134,10 +1362,11 @@ class ForecastVisualizer:
             save: Whether to save the plot
             show: Whether to display the plot
         """
-        if plt is None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
             logger.warning("matplotlib not installed. Cannot generate plots.")
             return
-        import matplotlib.pyplot as plt
         
         fig, axes = plt.subplots(2, 1, figsize=(14, 8), height_ratios=[2, 1])
         
@@ -1206,11 +1435,12 @@ class ForecastVisualizer:
             save: Whether to save
             show: Whether to display
         """
-        if plt is None or sns is None or scipy is None:
-            logger.warning("matplotlib/seaborn/scipy not installed. Cannot generate plots.")
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+        except ImportError:
+            logger.warning("matplotlib/seaborn not installed. Cannot generate plots.")
             return
-        import matplotlib.pyplot as plt
-        import seaborn as sns
         
         residuals = y_actual - y_predicted
         
@@ -1275,10 +1505,11 @@ class ForecastVisualizer:
             save: Whether to save
             show: Whether to display
         """
-        if plt is None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
             logger.warning("matplotlib not installed. Cannot generate plots.")
             return
-        import matplotlib.pyplot as plt
         
         if segment_col not in df.columns:
             logger.warning(f"Segment column '{segment_col}' not found in dataframe")
@@ -1345,10 +1576,11 @@ class ForecastVisualizer:
             save: Whether to save
             show: Whether to display
         """
-        if plt is None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
             logger.warning("matplotlib not installed. Cannot generate plots.")
             return
-        import matplotlib.pyplot as plt
         
         if date_col not in df.columns:
             logger.warning(f"Date column '{date_col}' not found")
@@ -1414,10 +1646,11 @@ class ForecastVisualizer:
             save: Whether to save
             show: Whether to display
         """
-        if plt is None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
             logger.warning("matplotlib not installed. Cannot generate plots.")
             return
-        import matplotlib.pyplot as plt
         
         models = list(metrics_dict.keys())
         metrics_to_plot = ["mae", "rmse", "mape"]
@@ -1472,30 +1705,25 @@ class ForecastVisualizer:
 
 class EnsembleTrainer:
     """
-    Ensemble trainer combining XGBoost, LightGBM, and CatBoost.
+    Ensemble trainer using LightGBM.
     
     Supports:
     - Individual model training
     - Weighted averaging
-    - Stacking (optional)
     - Model comparison
     """
 
     def __init__(
         self,
         data_config: Optional[DataConfig] = None,
-        use_xgb: bool = True,
         use_lgb: bool = True,
-        use_catboost: bool = True,
         weights: Optional[Dict[str, float]] = None,
     ):
         self.data_config = data_config or DataConfig()
-        self.use_xgb = use_xgb
         self.use_lgb = use_lgb
-        self.use_catboost = use_catboost
         
         # Model weights for ensemble (default: equal)
-        self.weights = weights or {"xgb": 1.0, "lgb": 1.0, "catboost": 1.0}
+        self.weights = weights or {"lgb": 1.0}
         
         self.models: Dict[str, Any] = {}
         self.feature_cols: List[str] = []
@@ -1513,33 +1741,8 @@ class EnsembleTrainer:
                 self.use_lgb = False
             else:
                 logger.info("LightGBM available")
-        
-        if self.use_catboost:
-            if catboost is None:
-                logger.warning("CatBoost not installed. Run: pip install catboost")
-                self.use_catboost = False
-            else:
-                logger.info("CatBoost available")
 
-    def _get_xgb_model(self, use_gpu: bool = False) -> Any:
-        """Get XGBoost model with optimal parameters."""
-        tree_method = "hist"
-        device = "cuda" if use_gpu else "cpu"
-        
-        return xgb.XGBRegressor(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.05, 
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=1.0,
-            min_child_weight=3,
-            random_state=42,
-            n_jobs=-1,
-            tree_method=tree_method,
-            device=device,
-            early_stopping_rounds=50,
-        )
+
 
     def _get_lgb_model(self, use_gpu: bool = False) -> Any:
         """Get LightGBM model with optimal parameters."""
@@ -1548,36 +1751,240 @@ class EnsembleTrainer:
         import lightgbm as lgb
         
         return lgb.LGBMRegressor(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.05,
+            n_estimators=3000,
+            max_depth=12,
+            num_leaves=128,
+            learning_rate=0.01,
             subsample=0.8,
             colsample_bytree=0.8,
-            reg_lambda=1.0,
-            min_child_samples=20,
+            reg_lambda=0.1,
+            min_child_samples=100,
             random_state=42,
             n_jobs=-1,
-            device="gpu" if use_gpu else "cpu",
+            device="cpu",
             verbose=-1,
-            force_row_wise=True,
+            objective="tweedie",
+            tweedie_variance_power=1.1,
         )
 
-    def _get_catboost_model(self, use_gpu: bool = False) -> Any:
-        """Get CatBoost model with optimal parameters."""
-        if catboost is None:
-            raise ImportError("CatBoost not installed. Run: pip install catboost")
-        from catboost import CatBoostRegressor
+
+
+    def _train_sequentially(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        use_gpu: bool = False,
+    ) -> Dict[str, float]:
+        """Train models sequentially to save memory."""
+        logger.info("Starting SEQUENTIAL training (Memory Optimization Mode)")
         
-        return CatBoostRegressor(
-            iterations=300,
-            depth=6,
-            learning_rate=0.05,
-            l2_leaf_reg=3.0,
-            random_state=42,
-            task_type="GPU" if use_gpu else "CPU",
-            verbose=False,
-            allow_writing_files=False,
-        )
+        # Log-transform targets for RMSLE (Optimize memory with float32)
+        y_train_log = np.log1p(y_train).astype(np.float32)
+        del y_train 
+        
+        y_val_log = np.log1p(y_val).astype(np.float32)
+        del y_val
+        gc.collect()
+
+        val_preds_log = {}
+        test_preds_log = {}
+        models_to_train = []
+        if self.use_lgb: models_to_train.append('lgb')
+        
+        # 1. Train each model, predict, save, delete
+        for model_name in models_to_train:
+            logger.info(f"Training {model_name}...")
+            
+            model = None
+            if model_name == 'lgb':
+                model = self._get_lgb_model(use_gpu)
+                callbacks = None
+                if lightgbm is not None:
+                    callbacks = [lightgbm.early_stopping(50, verbose=False)]
+                
+                # CHECK: If using Tweedie, we must train on RAW counts (unwrap log)
+                is_tweedie = model.objective == 'tweedie'
+                
+                if is_tweedie:
+                    y_train_raw = np.expm1(y_train_log)
+                    y_val_raw = np.expm1(y_val_log)
+                    model.fit(X_train, y_train_raw, eval_set=[(X_val, y_val_raw)], callbacks=callbacks)
+                else:
+                    model.fit(X_train, y_train_log, eval_set=[(X_val, y_val_log)], callbacks=callbacks)
+                    
+                self.models["lgb"] = model
+            
+            # Predict (log scale)
+            # RE-WRAP: If Tweedie was used, predictions are raw -> convert to log
+            if model_name == 'lgb' and getattr(model, 'objective', '') == 'tweedie':
+                 val_preds_log[model_name] = np.log1p(np.maximum(model.predict(X_val), 0))
+                 test_preds_log[model_name] = np.log1p(np.maximum(model.predict(X_test), 0))
+            else:
+                 val_preds_log[model_name] = model.predict(X_val)
+                 test_preds_log[model_name] = model.predict(X_test)
+            
+            # Calculate individual metrics (inverse transform for metrics)
+            y_val_pred = np.maximum(np.expm1(val_preds_log[model_name]), 0)
+            self.metrics_by_model[model_name] = Metrics.calculate(np.expm1(y_val_log), y_val_pred, "val_")
+            Metrics.log_metrics(self.metrics_by_model[model_name], f"VAL ({model_name})")
+            
+            # Save model immediately
+            self.save_model_component(model_name)
+            
+            # DELETE from memory
+            del self.models[model_name] # Remove from self.models to free memory
+            del model
+            gc.collect()
+            
+        # 2. Optimize Weights using saved predictions
+        if len(models_to_train) > 1:
+            # Inverse transform predictions for weight optimization
+            val_preds_original_scale = {name: np.maximum(np.expm1(preds_log), 0) for name, preds_log in val_preds_log.items()}
+            self.optimize_weights_from_preds(val_preds_original_scale, np.expm1(y_val_log), metric="rmse")
+        else:
+            self.weights = {m: 1.0 for m in models_to_train}
+            
+        # 3. Generate Ensemble Predictions (log scale, then inverse transform)
+        final_test_pred_log = np.zeros_like(test_preds_log[models_to_train[0]])
+        for m in models_to_train:
+            final_test_pred_log += self.weights[m] * test_preds_log[m]
+        
+        final_test_pred = np.maximum(np.expm1(final_test_pred_log), 0)
+
+        # 4. Calculate Final Metrics
+        metrics = Metrics.calculate(y_test, final_test_pred, prefix="test_")
+        self.metrics_by_model["ensemble"] = metrics
+        
+        # Log results
+        Metrics.log_metrics(metrics, "Ensemble (Sequential)")
+        return self.metrics_by_model
+
+    def save_model_component(self, model_name: str):
+        """Save individual model component to disk."""
+        path = self.data_config.output_root / "models"
+        path.mkdir(parents=True, exist_ok=True)
+        
+        if model_name not in self.models:
+            return
+
+        model = self.models[model_name]
+        try:
+            if model_name == 'lgb':
+                # LightGBM sklearn API uses booster_
+                model.booster_.save_model(str(path / "lightgbm.txt"))
+            logger.info(f"Saved {model_name} to {path}")
+        except Exception as e:
+            logger.warning(f"Failed to save {model_name}: {e}")
+
+    def load_model_component(self, model_name: str) -> Any:
+        """Load individual model component from disk."""
+        path = self.data_config.output_root / "models"
+        
+        try:
+            if model_name == 'lgb':
+                # Re-construct generic LGBMRegressor and load booster
+                import lightgbm as lgb
+                model = self._get_lgb_model()
+                booster = lgb.Booster(model_file=str(path / "lightgbm.txt"))
+                model._Booster = booster
+                model.fitted_ = True
+                return model
+        except Exception as e:
+            logger.warning(f"Could not load {model_name}: {e}")
+            return None
+        return None
+
+    def optimize_weights_from_preds(
+        self, 
+        val_preds: Dict[str, np.ndarray], 
+        y_val: pd.Series,
+        metric: str = "rmse"
+    ) -> Dict[str, float]:
+        """Optimize weights using pre-computed predictions.
+        
+        Args:
+            val_preds: Dictionary of model_name -> prediction array
+            y_val: Validation target series
+            metric: Metric to optimize
+        """
+        logger.info(f"Optimizing ensemble weights using {metric}...")
+        models = list(val_preds.keys())
+        
+        try:
+            from scipy.optimize import minimize
+        except ImportError:
+            logger.error("scipy not installed. Run: pip install scipy")
+            raise
+
+        n_models = len(models)
+        if n_models == 0:
+            raise ValueError("No model predictions provided for weight optimization.")
+        
+        def objective(weights):
+            weights = np.abs(weights)  # Ensure positive
+            weights = weights / weights.sum()  # Normalize
+            
+            ensemble_pred = np.zeros(len(y_val))
+            for i, name in enumerate(models):
+                ensemble_pred += val_preds[name] * weights[i]
+            
+            # Ensure predictions are non-negative
+            ensemble_pred = np.maximum(ensemble_pred, 0)
+            
+            if metric == "rmse":
+                return np.sqrt(mean_squared_error(y_val, ensemble_pred))
+            elif metric == "mae":
+                return mean_absolute_error(y_val, ensemble_pred)
+            elif metric == "mape":
+                denom = np.maximum(np.abs(y_val), 1e-6)
+                return np.mean(np.abs((y_val - ensemble_pred) / denom)) * 100
+            else: 
+                return np.sqrt(mean_squared_error(y_val, ensemble_pred))
+        
+        # Initialize equal weights
+        x0 = np.ones(n_models) / n_models
+        
+        # Bounds for weights (0 to 1)
+        bounds = [(0, 1)] * n_models
+        
+        # Constraints: sum of weights must be 1
+        constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+        
+        result = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints)
+        
+        optimal_weights = np.abs(result.x)
+        optimal_weights = optimal_weights / optimal_weights.sum()
+        
+        self.weights = {name: w for name, w in zip(models, optimal_weights)}
+             
+        logger.info(f"Optimized Weights: {self.weights}")
+        logger.info(f"Optimized {metric}: {result.fun:.4f}")
+        return self.weights
+
+    def optimize_weights(
+        self,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        metric: str = "rmse",
+    ) -> Dict[str, float]:
+        """Optimize ensemble weights using validation set (Standard mode)."""
+        # This wrapper calls the generic optimizer by generating predictions first
+        # Only works if models are in memory
+        if not self.models:
+             raise ValueError("No models in memory. Use optimize_weights_from_preds instead.")
+        
+        val_preds = {}
+        for name, model in self.models.items():
+             val_preds[name] = model.predict(X_val)
+             # Note: If models return log, we might need to inverse transform here depending on metric
+             # Assuming standard optimize_weights handles raw predictions? 
+             # Let's align it with optimize_weights_from_preds
+        
+        return self.optimize_weights_from_preds(val_preds, y_val, metric)
 
     def train(
         self,
@@ -1588,6 +1995,7 @@ class EnsembleTrainer:
         X_test: pd.DataFrame,
         y_test: pd.Series,
         use_gpu: bool = False,
+        sequential: bool = True,
     ) -> Dict[str, Dict[str, float]]:
         """
         Train all ensemble models with RMSLE strategy.
@@ -1597,102 +2005,61 @@ class EnsembleTrainer:
         logger.info("=" * 60)
         
         self.feature_cols = list(X_train.columns)
-        
-        # Log-transform targets for RMSLE (Optimize memory with float32)
-        y_train_log = np.log1p(y_train).astype(np.float32)
-        # Delete original y_train immediately to free memory (it's huge)
-        del y_train 
-        
-        y_val_log = np.log1p(y_val).astype(np.float32)
-        del y_val
-        gc.collect()
-        
-        # Train XGBoost
-        if self.use_xgb:
-            logger.info("\n--- Training XGBoost ---")
-            self.models["xgb"] = self._get_xgb_model(use_gpu)
-            self.models["xgb"].fit(
-                X_train, y_train_log,
-                eval_set=[(X_val, y_val_log)],
-                verbose=False,
-            )
-            # Predict and inverse transform
-            y_pred_log = self.models["xgb"].predict(X_test)
-            y_pred = np.maximum(np.expm1(y_pred_log), 0)
-            self.metrics_by_model["xgb"] = Metrics.calculate(y_test, y_pred, "test_")
-            Metrics.log_metrics(self.metrics_by_model["xgb"], "TEST")
-            
-            # OPTIONAL: Save model to disk and clear from memory if tight? 
-            # For now, let's keep it but force GC
-            gc.collect()
-        
-        # Train LightGBM
-        if self.use_lgb:
-            logger.info("\n--- Training LightGBM ---")
-            self.models["lgb"] = self._get_lgb_model(use_gpu)
-            callbacks = None
-            if lightgbm is not None:
-                callbacks = [lightgbm.early_stopping(50, verbose=False)]
-            self.models["lgb"].fit(
-                X_train, y_train_log,
-                eval_set=[(X_val, y_val_log)],
-                callbacks=callbacks
-            )
-            y_pred_log = self.models["lgb"].predict(X_test)
-            y_pred = np.maximum(np.expm1(y_pred_log), 0)
-            self.metrics_by_model["lgb"] = Metrics.calculate(y_test, y_pred, "test_")
-            Metrics.log_metrics(self.metrics_by_model["lgb"], "TEST")
-        
-        # Train CatBoost
-        if self.use_catboost:
-            logger.info("\n--- Training CatBoost ---")
-            self.models["catboost"] = self._get_catboost_model(use_gpu)
-            self.models["catboost"].fit(
-                X_train, y_train_log,
-                eval_set=(X_val, y_val_log),
-                early_stopping_rounds=50,
-                verbose=False
-            )
-            y_pred_log = self.models["catboost"].predict(X_test)
-            y_pred = np.maximum(np.expm1(y_pred_log), 0)
-            self.metrics_by_model["catboost"] = Metrics.calculate(y_test, y_pred, "test_")
-            Metrics.log_metrics(self.metrics_by_model["catboost"], "TEST")
-        
-        # Ensemble prediction
-        logger.info("\n--- Ensemble Prediction ---")
-        y_ensemble_log = self.predict_ensemble(X_test)
-        y_ensemble = np.maximum(np.expm1(y_ensemble_log), 0)
-        self.metrics_by_model["ensemble"] = Metrics.calculate(y_test, y_ensemble, "test_")
-        Metrics.log_metrics(self.metrics_by_model["ensemble"], "TEST")
-        
-        return self.metrics_by_model
+
+        if sequential:
+            return self._train_sequentially(X_train, y_train, X_val, y_val, X_test, y_test, use_gpu)
+
+        # Original parallel logic (fallback)
+        logger.info("Starting STANDARD training (All-in-memory)...")
+        # Reuse sequential logic for simplicity or implement parallel if strictly needed
+        # For this fix, we map to sequential as it is the safe default
+        return self._train_sequentially(X_train, y_train, X_val, y_val, X_test, y_test, use_gpu)
 
     def predict_model(self, X: pd.DataFrame, model_name: str) -> np.ndarray:
         """Predict using a specific model (returns LOG scale)."""
         if model_name not in self.models:
-            raise ValueError(f"Model '{model_name}' not trained")
+             # Try loading
+             model = self.load_model_component(model_name)
+             if model:
+                 return model.predict(X)
+             raise ValueError(f"Model '{model_name}' not trained or found")
         
         return self.models[model_name].predict(X)
 
-    # Alias for sklearn compatibility / pipeline integration
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Predict using the ensemble (returns LOG scale)."""
         return self.predict_ensemble(X)
 
     @property
     def feature_importances_(self) -> np.ndarray:
-        """Return avg feature importance from XGB/LGB models (CatBoost often differs)."""
-        importances = []
-        if self.use_xgb and "xgb" in self.models:
-            importances.append(self.models["xgb"].feature_importances_)
-        if self.use_lgb and "lgb" in self.models:
-            importances.append(self.models["lgb"].feature_importances_)
+        """Return avg feature importance (Loads LGBM if needed)."""
+        if not self.feature_cols:
+            return np.array([])
             
-        if not importances:
-            return np.zeros(len(self.feature_cols))
+        # Try to use LightGBM as the representative model
+        if 'lgb' in self.models:
+            model = self.models['lgb']
+            if hasattr(model, 'feature_importances_'):
+                return model.feature_importances_
+            elif hasattr(model, 'feature_importance'): # Booster
+                return model.feature_importance()
+        
+        # Try loading from disk
+        model = self.load_model_component('lgb')
+        if model:
+            # Handle sklearn wrapper vs Booster
+            if hasattr(model, 'feature_importances_'):
+                imp = model.feature_importances_
+            elif hasattr(model, '_Booster'):
+                 imp = model._Booster.feature_importance()
+            else:
+                 imp = np.zeros(len(self.feature_cols))
             
-        # Average available importances
-        return np.mean(importances, axis=0)
+            del model
+            gc.collect()
+            return imp
+
+        return np.zeros(len(self.feature_cols))
 
     def predict_ensemble(
         self,
@@ -1707,20 +2074,63 @@ class EnsembleTrainer:
         predictions = []
         total_weight = 0
         
-        for name, model in self.models.items():
-            if name in weights:
-                # Predict (returns log scale)
-                pred_log = model.predict(X)
+        # Identify models needing prediction logic
+        required_models = [k for k, v in weights.items() if v > 0]
+        
+        for name in required_models:
+            model = self.models.get(name)
+            loaded_temp = False
+            
+            # Try to load if missing
+            if model is None:
+                logger.info(f"Loading {name} from disk for prediction...")
+                model = self.load_model_component(name)
+                loaded_temp = True
+                
+            if model:
+                # Predict
+                if name == 'lgb' and hasattr(model, '_Booster'):
+                     # If we manually loaded LGB booster
+                     pred_raw = model._Booster.predict(X)
+                     # Check if it was Tweedie (heuristic or attribute)
+                     # For safety in this specific pipeline version, we assume LGB is always Tweedie if we are here
+                     # But let's be safe: If values are huge, it's likely raw
+                     pred_log = np.log1p(np.maximum(pred_raw, 0))
+                else:
+                     # Sklearn API
+                     pred = model.predict(X)
+                     
+                     # CHECK: Re-wrap if Tweedie (Raw -> Log)
+                     is_tweedie = False
+                     if name == 'lgb':
+                         if hasattr(model, 'objective') and model.objective == 'tweedie':
+                             is_tweedie = True
+                         elif hasattr(model, 'get_params') and model.get_params().get('objective') == 'tweedie':
+                             is_tweedie = True
+                     
+                     if is_tweedie:
+                         pred_log = np.log1p(np.maximum(pred, 0))
+                     else:
+                         pred_log = pred
+                
                 predictions.append(pred_log * weights[name])
                 total_weight += weights[name]
+                
+                # Unload if it was temporary
+                if loaded_temp:
+                    del model
+                    gc.collect()
+            else:
+                logger.warning(f"Model {name} missing for prediction (Skipping)")
         
         if total_weight == 0:
+            # Fallback if everything failed? Or raise error
             raise ValueError("No models available for prediction")
         
         # Average on log scale
+        # Re-normalize if some models failed loading
         ensemble_log = np.sum(predictions, axis=0) / total_weight
         
-        # Return LOG scale (pipeline handles inverse transform)
         return ensemble_log
 
     def optimize_weights(
@@ -1861,6 +2271,91 @@ class EnsembleTrainer:
         
         return comparison_df
 
+    def save_model(self, path: Union[str, Path]) -> None:
+        """
+        Save the ensemble model and all sub-models.
+        
+        Args:
+            path: Base path for saving (will create a directory)
+        """
+        import pickle
+        from pathlib import Path
+        
+        path = Path(path)
+        
+        # If path has .json extension, remove it and treat as directory base
+        if path.suffix == '.json':
+            path = path.with_suffix('')
+        
+        # Create directory for ensemble
+        ensemble_dir = path.parent / f"{path.stem}_ensemble"
+        ensemble_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save individual models
+        for name, model in self.models.items():
+            model_path = ensemble_dir / f"{name}_model"
+            
+            if name == "lgb":
+                model.booster_.save_model(str(model_path) + ".txt")
+        
+        # Save metadata (weights, feature_cols, metrics)
+        metadata = {
+            "weights": self.weights,
+            "feature_cols": self.feature_cols,
+            "metrics_by_model": self.metrics_by_model,
+            "use_lgb": self.use_lgb,
+        }
+        
+        metadata_path = ensemble_dir / "metadata.pkl"
+        with open(metadata_path, "wb") as f:
+            pickle.dump(metadata, f)
+        
+        logger.info(f"Saved ensemble model to {ensemble_dir}")
+
+    def load_model(self, path: Union[str, Path]) -> None:
+        """
+        Load the ensemble model and all sub-models.
+        
+        Args:
+            path: Base path where ensemble was saved
+        """
+        import pickle
+        from pathlib import Path
+        
+        path = Path(path)
+        
+        # If path has .json extension, remove it
+        if path.suffix == '.json':
+            path = path.with_suffix('')
+        
+        # Construct ensemble directory path
+        ensemble_dir = path.parent / f"{path.stem}_ensemble"
+        
+        if not ensemble_dir.exists():
+            raise FileNotFoundError(f"Ensemble directory not found: {ensemble_dir}")
+        
+        # Load metadata
+        metadata_path = ensemble_dir / "metadata.pkl"
+        with open(metadata_path, "rb") as f:
+            metadata = pickle.load(f)
+        
+        self.weights = metadata["weights"]
+        self.feature_cols = metadata["feature_cols"]
+        self.metrics_by_model = metadata["metrics_by_model"]
+        self.use_lgb = metadata["use_lgb"]
+        
+        # Load individual models
+        self.models = {}
+        
+        if self.use_lgb and lightgbm is not None:
+            lgb_path = ensemble_dir / "lgb_model.txt"
+            if lgb_path.exists():
+                import lightgbm as lgb_
+                self.models["lgb"] = lgb_.Booster(model_file=str(lgb_path))
+        
+        logger.info(f"Loaded ensemble model from {ensemble_dir}")
+
+
 
 # =============================================================================
 # MULTI-STEP FORECASTING
@@ -1890,7 +2385,7 @@ class MultiStepForecaster:
         self,
         horizons: List[int] = None,
         strategy: str = "direct",
-        base_model: str = "xgboost",
+        base_model: str = "lightgbm",
         data_config: Optional[DataConfig] = None,
     ):
         """
@@ -1899,7 +2394,7 @@ class MultiStepForecaster:
         Args:
             horizons: Forecast horizons in days (e.g., [1, 7, 14, 30])
             strategy: Forecasting strategy ('recursive', 'direct', 'multi_output')
-            base_model: Base model type ('xgboost', 'lightgbm', 'catboost')
+            base_model: Base model type ('lightgbm')
             data_config: Data configuration
         """
         self.horizons = horizons or [1, 7, 14, 30]
@@ -1918,26 +2413,13 @@ class MultiStepForecaster:
 
     def _get_base_model(self, use_gpu: bool = False) -> Any:
         """Get base model instance."""
-        if self.base_model == "xgboost":
-            tree_method = "gpu_hist" if use_gpu else "hist"
-            device = "cuda" if use_gpu else "cpu"
-            return xgb.XGBRegressor(
-                n_estimators=300,
-                max_depth=6,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                n_jobs=-1,
-                tree_method=tree_method,
-                device=device,
-            )
-        elif self.base_model == "lightgbm":
+        if self.base_model == "lightgbm":
             if lightgbm is not None:
                 import lightgbm as lgb
                 return lgb.LGBMRegressor(
-                    n_estimators=300,
-                    max_depth=6,
+                    n_estimators=3000,
+                    max_depth=12,
+                    num_leaves=128,
                     learning_rate=0.05,
                     subsample=0.8,
                     random_state=42,
@@ -1945,21 +2427,7 @@ class MultiStepForecaster:
                     verbose=-1,
                 )
             else:
-                logger.warning("LightGBM not available, falling back to XGBoost")
-                return self._get_base_model(use_gpu)
-        elif self.base_model == "catboost":
-            if catboost is not None:
-                from catboost import CatBoostRegressor
-                return CatBoostRegressor(
-                    iterations=300,
-                    depth=6,
-                    learning_rate=0.05,
-                    random_state=42,
-                    verbose=False,
-                )
-            else:
-                logger.warning("CatBoost not available, falling back to XGBoost")
-                return self._get_base_model(use_gpu)
+                raise ImportError("LightGBM not installed. Run: pip install lightgbm")
         else:
             raise ValueError(f"Unknown base model: {self.base_model}")
 
@@ -2489,9 +2957,9 @@ class TrainingPipeline:
         self.test_df: Optional[pd.DataFrame] = None
         
         # Model and results
-        self.baseline_model: Optional[xgb.XGBRegressor] = None
-        self.best_model: Optional[xgb.XGBRegressor] = None
-        self.final_model: Optional[xgb.XGBRegressor] = None
+        self.baseline_model: Optional[Any] = None
+        self.best_model: Optional[Any] = None
+        self.final_model: Optional[Any] = None
         self.ensemble_trainer: Optional[EnsembleTrainer] = None
         
         self.feature_cols: List[str] = []
@@ -2509,15 +2977,7 @@ class TrainingPipeline:
 
     def _detect_device(self) -> Tuple[str, str]:
         """Detect GPU availability."""
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi"], capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                return "hist", "cuda"
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        # For LightGBM, always use CPU to avoid CUDA compilation issues
         return "hist", "cpu"
 
     # =========================================================================
@@ -2586,6 +3046,10 @@ class TrainingPipeline:
         Returns:
             Baseline metrics on validation set
         """
+        if lightgbm is None:
+            raise ImportError("LightGBM not installed. Run: pip install lightgbm")
+        import lightgbm as lgb
+
         logger.info("\n" + "=" * 60)
         logger.info("STEP 2: ESTABLISHING BASELINE")
         logger.info("=" * 60)
@@ -2594,12 +3058,13 @@ class TrainingPipeline:
             raise ValueError("Data not split. Call split_data() first.")
         
         target = self.data_config.target_col
-        tree_method, device = self._detect_device()
+        _, device = self._detect_device()
         
-        # Default XGBoost parameters
+        # Default LightGBM parameters
         default_params = {
-            "n_estimators": 500,
-            "max_depth": 6,
+            "n_estimators": 1000,
+            "max_depth": 8,
+            "num_leaves": 64,
             "learning_rate": 0.1,
             "subsample": 0.8,
             "colsample_bytree": 0.8,
@@ -2608,14 +3073,13 @@ class TrainingPipeline:
             "min_child_weight": 1,
             "random_state": self.random_state,
             "n_jobs": -1,
-            "tree_method": tree_method,
             "device": device,
-            "early_stopping_rounds": early_stopping_rounds,
+            "verbose": -1,
         }
         
         logger.info("\nDefault parameters:")
         for k, v in default_params.items():
-            if k not in ["n_jobs", "random_state", "tree_method", "device"]:
+            if k not in ["n_jobs", "random_state", "device", "verbose"]:
                 logger.info(f"  {k}: {v}")
         
         # Prepare data
@@ -2626,16 +3090,17 @@ class TrainingPipeline:
         
         # Train baseline
         logger.info("\nTraining baseline model (Target transformed with log1p)...")
-        self.baseline_model = xgb.XGBRegressor(**default_params)
+        self.baseline_model = lgb.LGBMRegressor(**default_params)
         
         # Log-transform targets for RMSLE optimization
         y_train_log = np.log1p(y_train).astype(np.float32)
         y_val_log = np.log1p(y_val).astype(np.float32)
         
+        callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
         self.baseline_model.fit(
             X_train, y_train_log,
             eval_set=[(X_val, y_val_log)],
-            verbose=False,
+            callbacks=callbacks,
         )
         
         # Evaluate on validation (inverse transform prediction)
@@ -2650,8 +3115,8 @@ class TrainingPipeline:
         logger.info(f"MAPE: {self.baseline_metrics['baseline_mape']:.2f}%")
         logger.info(f"R²:   {self.baseline_metrics['baseline_r2']:.4f}")
         
-        if self.baseline_model.best_iteration:
-            logger.info(f"\nEarly stopping at iteration: {self.baseline_model.best_iteration}")
+        if self.baseline_model.best_iteration_:
+            logger.info(f"\nEarly stopping at iteration: {self.baseline_model.best_iteration_}")
         
         return self.baseline_metrics
 
@@ -2714,10 +3179,13 @@ class TrainingPipeline:
         
         def objective(trial: optuna.Trial) -> float:
             """Optuna objective function."""
+            import lightgbm as lgb
+            
             params = {
                 # Core hyperparameters
-                "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+                "n_estimators": trial.suggest_int("n_estimators", 100, 3000),
                 "max_depth": trial.suggest_int("max_depth", 3, 12),
+                "num_leaves": trial.suggest_int("num_leaves", 31, 255),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
                 
                 # Regularization
@@ -2726,21 +3194,20 @@ class TrainingPipeline:
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.01, 10.0, log=True),
                 "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 10.0, log=True),
                 "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
-                "gamma": trial.suggest_float("gamma", 0.0, 1.0),
                 
                 # Fixed parameters
                 "random_state": self.random_state,
                 "n_jobs": -1,
-                "tree_method": tree_method,
                 "device": device,
-                "early_stopping_rounds": early_stopping_rounds,
+                "verbose": -1,
             }
             
-            model = xgb.XGBRegressor(**params)
+            model = lgb.LGBMRegressor(**params)
+            callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
             model.fit(
                 X_train, y_train_log,
                 eval_set=[(X_val, y_val_log)],
-                verbose=False,
+                callbacks=callbacks,
             )
             
             # Predict on log scale
@@ -2784,20 +3251,22 @@ class TrainingPipeline:
                 logger.info(f"  {k}: {v}")
         
         # Train model with best params to get metrics
+        import lightgbm as lgb
+        
         best_full_params = {
             **self.best_params,
             "random_state": self.random_state,
             "n_jobs": -1,
-            "tree_method": tree_method,
             "device": device,
-            "early_stopping_rounds": early_stopping_rounds,
+            "verbose": -1,
         }
         
-        self.best_model = xgb.XGBRegressor(**best_full_params)
+        self.best_model = lgb.LGBMRegressor(**best_full_params)
+        callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
         self.best_model.fit(
             X_train, y_train_log,
             eval_set=[(X_val, y_val_log)],
-            verbose=False,
+            callbacks=callbacks,
         )
         
         y_val_pred_log = self.best_model.predict(X_val)
@@ -2836,7 +3305,7 @@ class TrainingPipeline:
     def train_final_model(
         self,
         early_stopping_rounds: int = 50,
-    ) -> xgb.XGBRegressor:
+    ) -> Any:
         """
         Train final model on combined train+val data with best hyperparameters.
         
@@ -2848,6 +3317,10 @@ class TrainingPipeline:
         Returns:
             Final trained model
         """
+        if lightgbm is None:
+            raise ImportError("LightGBM not installed. Run: pip install lightgbm")
+        import lightgbm as lgb
+
         logger.info("\n" + "=" * 60)
         logger.info("STEP 4 & 5: FINAL TRAINING (Train + Val)")
         logger.info("=" * 60)
@@ -2856,7 +3329,7 @@ class TrainingPipeline:
             raise ValueError("No best params. Call tune_hyperparameters() first.")
         
         target = self.data_config.target_col
-        tree_method, device = self._detect_device()
+        _, device = self._detect_device()
         
         # Combine train and validation data
         combined_df = pd.concat([self.train_df, self.val_df], ignore_index=True)
@@ -2886,21 +3359,21 @@ class TrainingPipeline:
             **self.best_params,
             "random_state": self.random_state,
             "n_jobs": -1,
-            "tree_method": tree_method,
             "device": device,
-            "early_stopping_rounds": early_stopping_rounds,
+            "verbose": -1,
         }
         
         logger.info("\nTraining final model with optimized hyperparameters (Target transformed)...")
-        self.final_model = xgb.XGBRegressor(**final_params)
+        self.final_model = lgb.LGBMRegressor(**final_params)
+        callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False), lgb.log_evaluation(100)]
         self.final_model.fit(
             X_train, y_train_log,
             eval_set=[(X_holdout, y_holdout_log)],
-            verbose=100,
+            callbacks=callbacks,
         )
         
-        if self.final_model.best_iteration:
-            logger.info(f"\nEarly stopping at iteration: {self.final_model.best_iteration}")
+        if self.final_model.best_iteration_:
+            logger.info(f"\nEarly stopping at iteration: {self.final_model.best_iteration_}")
         
         return self.final_model
 
@@ -2929,9 +3402,7 @@ class TrainingPipeline:
         
         self.ensemble_trainer = EnsembleTrainer(
             data_config=self.data_config,
-            use_xgb=True,
             use_lgb=True,
-            use_catboost=True,
         )
         
         # Train and get metrics
@@ -3093,25 +3564,32 @@ class TrainingPipeline:
         logger.info("#" * 60)
         
         logger.info("\nMetrics Comparison:")
-        logger.info(f"{'Stage':<20} {'MAE':>10} {'RMSE':>10} {'MAPE':>10}")
-        logger.info("-" * 52)
+        logger.info(f"{'Stage':<20} {'MAE':>10} {'RMSE':>10} {'MAPE':>10} {'WMAPE':>10}")
+        logger.info("-" * 64)
         logger.info(
             f"{'Baseline (val)':<20} "
-            f"{self.baseline_metrics['baseline_mae']:>10.2f} "
-            f"{self.baseline_metrics['baseline_rmse']:>10.2f} "
-            f"{self.baseline_metrics['baseline_mape']:>9.2f}%"
+            f"{self.baseline_metrics.get('baseline_mae', 0):>10.2f} "
+            f"{self.baseline_metrics.get('baseline_rmse', 0):>10.2f} "
+            f"{self.baseline_metrics.get('baseline_mape', 0):>9.2f}% "
+            f"{self.baseline_metrics.get('baseline_wmape', 0):>9.2f}%"
         )
-        logger.info(
-            f"{'Tuned (val)':<20} "
-            f"{self.tuning_metrics['tuned_mae']:>10.2f} "
-            f"{self.tuning_metrics['tuned_rmse']:>10.2f} "
-            f"{self.tuning_metrics['tuned_mape']:>9.2f}%"
-        )
+        
+        # Only show tuning metrics if tuning was actually performed
+        if self.tuning_metrics and self.tuning_metrics.get('tuned_mae', 0) > 0:
+            logger.info(
+                f"{'Tuned (val)':<20} "
+                f"{self.tuning_metrics.get('tuned_mae', 0):>10.2f} "
+                f"{self.tuning_metrics.get('tuned_rmse', 0):>10.2f} "
+                f"{self.tuning_metrics.get('tuned_mape', 0):>9.2f}% "
+                f"{self.tuning_metrics.get('tuned_wmape', 0):>9.2f}%"
+            )
+        
         logger.info(
             f"{'Final (test)':<20} "
-            f"{self.final_metrics['test_mae']:>10.2f} "
-            f"{self.final_metrics['test_rmse']:>10.2f} "
-            f"{self.final_metrics['test_mape']:>9.2f}%"
+            f"{self.final_metrics.get('test_mae', 0):>10.2f} "
+            f"{self.final_metrics.get('test_rmse', 0):>10.2f} "
+            f"{self.final_metrics.get('test_mape', 0):>9.2f}% "
+            f"{self.final_metrics.get('test_wmape', 0):>9.2f}%"
         )
         
         return {
@@ -3271,8 +3749,8 @@ def main():
     import os
     
     # Auto-detect data path (kagglehub cache or local)
-    kaggle_input_path = Path("/kaggle/input/fmcg-dataset")
-    kagglehub_path = Path.home() / ".cache" / "kagglehub" / "datasets" / "sand35h44jsd" / "fmcg-dataset" / "versions" / "1"
+    kaggle_input_path = Path("/kaggle/input/fmcgparquet")
+    kagglehub_path = Path.home() / ".cache" / "kagglehub" / "datasets" / "sand35h44jsd" / "fmcgparquet" / "versions" / "1"
     local_path = Path("./data")
     
     if kaggle_input_path.exists():
@@ -3288,7 +3766,7 @@ def main():
         # Try to download using kagglehub
         try:
             import kagglehub
-            data_root = Path(kagglehub.dataset_download('sand35h44jsd/fmcg-dataset'))
+            data_root = Path(kagglehub.dataset_download('sand35h44jsd/fmcgparquet'))
             logger.info(f"Downloaded data to: {data_root}")
         except ImportError:
             logger.error("kagglehub not installed. Run: pip install kagglehub")
@@ -3320,7 +3798,8 @@ def main():
     logger.info("\nLoading and preparing data...")
     
     # Load raw data
-    daily_ts = pd.read_csv(data_config.data_root / data_config.daily_ts_file, parse_dates=["date"])
+    daily_ts = pd.read_parquet(data_config.data_root / data_config.daily_ts_file)
+    daily_ts = reduce_mem_usage(daily_ts)
     logger.info(f"Loaded {len(daily_ts):,} rows from {data_config.daily_ts_file}")
     
     # Initialize feature engineer and load reference data

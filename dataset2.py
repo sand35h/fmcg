@@ -134,16 +134,58 @@ def create_sku_master_with_lifecycle(n_skus, start_date, end_date):
     end_dt = pd.to_datetime(end_date)
     total_days = (end_dt - start_dt).days
     
-    brands = [f"Brand_{chr(65+i)}" for i in range(10)]
-    categories = ["DAIRY", "BEVERAGES", "SNACKS", "HOMECARE", "PERSONALCARE", "NOODLES", "BISCUITS"]
-    pack_sizes = ['200ml', '500ml', '1L', '50g', '100g', '250g', '500g', '1kg']
+    # Real-world UK FMCG Examples
+    real_products = {
+        "DAIRY": [
+            ("Muller Corner Yogurt", "Muller", "175g"), ("Cheddar Cheese Block", "Cathedral City", "350g"),
+            ("Semi Skimmed Milk", "Yeo Valley", "2L"), ("Salted Butter", "Lurpak", "250g"),
+            ("Oat Milk Barista", "Oatly", "1L")
+        ],
+        "BEVERAGES": [
+            ("Coca Cola Original", "Coca-Cola", "1.5L"), ("Diet Coke", "Coca-Cola", "330ml"),
+            ("Nescafe Gold Blend", "Nestle", "200g"), ("Tropicana Orange Juice", "Tropicana", "900ml"),
+            ("Yorkshire Tea Bags", "Taylors", "160ct"), ("Red Bull Energy", "Red Bull", "250ml")
+        ],
+        "SNACKS": [
+            ("Dairy Milk Bar", "Cadbury", "110g"), ("Walkers Cheese & Onion", "Walkers", "32g"),
+            ("Pringles Sour Cream", "Kellogg's", "200g"), ("McVities Digestives", "McVities", "400g"),
+            ("KitKat 4 Finger", "Nestle", "45g")
+        ],
+        "HOMECARE": [
+            ("Fairy Liquid Lemon", "P&G", "433ml"), ("Persil Bio Capsules", "Unilever", "30ct"),
+            ("Toilet Tissue 9 Roll", "Andrex", "9pk"), ("Domestos Bleach", "Unilever", "750ml")
+        ],
+        "PERSONALCARE": [
+            ("Dove Beauty Bar", "Unilever", "2pk"), ("Colgate Total Toothpaste", "Colgate", "75ml"),
+            ("Nivea Men Deodorant", "Beiersdorf", "150ml"), ("Head & Shoulders Shampoo", "P&G", "500ml")
+        ],
+        "NOODLES": [
+            ("Pot Noodle Chicken", "Unilever", "90g"), ("Super Noodles BBQ", "Batchelors", "100g")
+        ],
+        "BISCUITS": [
+            ("Jammie Dodgers", "Burtons", "140g"), ("Oreo Original", "Mondelez", "154g")
+        ]
+    }
     
     skus = []
-    active_skus = int(n_skus * 0.7)  # 70% active from start
+    active_skus = int(n_skus * 0.7)
     new_launches = n_skus - active_skus
     
+    flat_products = []
+    for cat, items in real_products.items():
+        for name, brand, size in items:
+            flat_products.append({'cat': cat, 'name': name, 'brand': brand, 'size': size})
+    
+    # Cycle through real list if n_skus > len(products)
     for i in range(n_skus):
-        category = np.random.choice(categories)
+        template = flat_products[i % len(flat_products)]
+        category = template['cat']
+        
+        # Add slight variation if repeating
+        suffix = "" if i < len(flat_products) else f" v{i//len(flat_products)+1}"
+        sku_name = template['name'] + suffix
+        brand = template['brand']
+        pack_size = template['size']
         
         # Lifecycle dates
         if i < active_skus:
@@ -179,11 +221,11 @@ def create_sku_master_with_lifecycle(n_skus, start_date, end_date):
         
         skus.append({
             'sku_id': f"SKU_{i+1:04d}",
-            'sku_name': f"{np.random.choice(brands)}_{category[:3]}_{i+1}",
-            'brand': np.random.choice(brands),
+            'sku_name': sku_name,
+            'brand': brand,
             'category': category,
             'segment': np.random.choice(['Premium', 'Mid-Range', 'Economy']),
-            'pack_size': np.random.choice(pack_sizes),
+            'pack_size': pack_size,
             'base_price': base_price,
             'cost': round(base_price * np.random.uniform(0.5, 0.75), 2),
             'shelf_life_days': shelf_life,
@@ -428,36 +470,84 @@ def generate_strategic_promotions(start_date, end_date, fest_df):
 
 
 # =============================================================================
-# 7. WEATHER & MACRO (REUSE FROM ORIGINAL)
+# 7. WEATHER, MACRO & COMPETITOR (REUSE FROM ORIGINAL)
 # =============================================================================
 
+def generate_competitor_activity(start_date, end_date):
+    """Generates competitor promotional activity and pricing."""
+    logging.info("Generating competitor activity data...")
+    dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    n_days = len(dates)
+    
+    # Competitor promotions (5% chance)
+    promo_occurs = np.random.rand(n_days) < 0.05
+    comp_promo_intensity = np.where(promo_occurs, np.random.uniform(0.1, 0.3, n_days), 0)
+    
+    # Competitor pricing pressure (1.0 = Parity, >1.0 = They are cheap)
+    comp_price_pressure = 1.0 + np.random.normal(0, 0.02, n_days)
+    
+    comp_df = pd.DataFrame({
+        'date': dates,
+        'competitor_promo_intensity': np.round(comp_promo_intensity, 3),
+        'competitor_price_pressure': np.round(comp_price_pressure, 3)
+    })
+    
+    return comp_df
+
 def generate_weather_data(start_date, end_date):
-    """UK weather simulation."""
+    """
+    UK weather simulation mirroring Public API fields (OpenWeather/MetOffice).
+    Generates: avg/min/max temp, precipitation, humidity, wind speed.
+    """
+    logging.info("Generating realistic API-style weather data...")
     dates = pd.date_range(start=start_date, end=end_date, freq='D')
     n_days = len(dates)
     
     months = dates.month.values
     day_of_year = dates.dayofyear.values
     
+    # 1. Temperature (Sine wave + random)
     base_temp = 10 + 8 * np.sin(2 * np.pi * (day_of_year - 80) / 365)
-    temp = base_temp + np.random.normal(0, 3, n_days)
+    avg_temp = base_temp + np.random.normal(0, 3, n_days)
     
+    # Min/Max spread (correlated with season, wider in summer)
+    temp_spread = np.where(np.isin(months, [6, 7, 8]), 
+                          np.random.normal(10, 2, n_days), # Summer spread
+                          np.random.normal(6, 1.5, n_days)) # Winter spread
+    
+    max_temp = avg_temp + (temp_spread / 2)
+    min_temp = avg_temp - (temp_spread / 2)
+    
+    # 2. Rain & Snow
     is_summer = np.isin(months, [6, 7, 8])
-    is_winter = np.isin(months, [12, 1, 2])
-    
     rainfall_prob = np.where(is_summer, 0.35, 0.50)
     rain_occurs = np.random.rand(n_days) < rainfall_prob
-    rainfall = np.where(rain_occurs, np.random.exponential(10), 0)
+    precip_mm = np.where(rain_occurs, np.random.exponential(5), 0)
     
+    # 3. Humidity (UK is humid, usually 70-90%)
+    humidity = 80 - (max_temp - 15) + np.random.normal(0, 5, n_days)
+    humidity = np.clip(humidity, 40, 100)
+    
+    # 4. Wind Speed (km/h)
+    wind_speed = np.random.gamma(5, 3, n_days) # Skewed, avg around 15 km/h
+    
+    # 5. Internal Demand Factor (The "Truth" for simulation)
+    # High temp -> Boost beverages/ice cream
+    # Rain -> Drop implementation
     weather_demand_factor = np.ones(n_days)
-    weather_demand_factor = np.where(temp > 20, 1.15, weather_demand_factor)
-    weather_demand_factor = np.where(temp < 5, 1.10, weather_demand_factor)
+    weather_demand_factor = np.where(max_temp > 22, 1.15, weather_demand_factor) # Hot days
+    weather_demand_factor = np.where(max_temp < 5, 1.05, weather_demand_factor)  # Cold days (soup etc)
+    weather_demand_factor = np.where(precip_mm > 5.0, weather_demand_factor * 0.95, weather_demand_factor) # Heavy rain
     
     weather_df = pd.DataFrame({
         'date': dates,
-        'temperature_c': np.round(temp, 1),
-        'rainfall_mm': np.round(rainfall, 1),
-        'weather_demand_factor': np.round(weather_demand_factor, 3)
+        'avg_temp_c': np.round(avg_temp, 1),
+        'min_temp_c': np.round(min_temp, 1),
+        'max_temp_c': np.round(max_temp, 1),
+        'precipitation_mm': np.round(precip_mm, 1),
+        'avg_humidity_pct': np.round(humidity, 1),
+        'wind_speed_kmh': np.round(wind_speed, 1),
+        'weather_demand_factor': np.round(weather_demand_factor, 3) # Latent feature for simulation
     })
     
     return weather_df
@@ -488,7 +578,7 @@ def generate_monthly_macro(start_date, end_date):
 # =============================================================================
 
 def simulate_demand_v2(sku_master, loc_master, start_date, end_date, fest_df, weather_df, 
-                       macro_df, shock_df, promo_calendar):
+                       macro_df, shock_df, promo_calendar, comp_df):
     """Enhanced demand simulation with all improvements."""
     logging.info("Starting enhanced demand simulation v2.0...")
     
@@ -519,6 +609,15 @@ def simulate_demand_v2(sku_master, loc_master, start_date, end_date, fest_df, we
     # Weather effect
     weather_effect = weather_df.set_index('date')['weather_demand_factor'].reindex(dates).fillna(1.0).values
     
+    # Competitor effect (New)
+    try:
+        comp_promo = comp_df.set_index('date')['competitor_promo_intensity'].reindex(dates).fillna(0).values
+        comp_price = comp_df.set_index('date')['competitor_price_pressure'].reindex(dates).fillna(1.0).values
+    except Exception as e:
+        logging.warning(f"Competitor data error: {e}. Using defaults.")
+        comp_promo = np.zeros(N)
+        comp_price = np.ones(N)
+
     # Macro effect
     month_starts = dates.to_period('M').to_timestamp()
     macro_indexed = macro_df.set_index('month')['consumer_confidence']
@@ -596,12 +695,18 @@ def simulate_demand_v2(sku_master, loc_master, start_date, end_date, fest_df, we
         # Price elasticity
         price_effect = np.power(price_ts / base_price_ts, -1.2)
         
+        # Competitor Impact (New)
+        # If competitor pressure > 1 (cheaper), we lose demand
+        comp_impact = 1.0 - (comp_promo * 0.4) # Promo steals 40%
+        comp_impact *= np.clip(1.0 - (comp_price - 1.0) * 2.0, 0.5, 1.5) # Price sensitivity to competitors
+        
         # Combined expected demand
         expected = (mean_demand * 
                    price_effect * 
                    festival_multiplier * 
                    macro_effect_ts * 
                    weather_effect * 
+                   comp_impact *
                    shock_demand)
         
         # Cross-SKU effects (substitution from competing SKUs)
@@ -619,8 +724,15 @@ def simulate_demand_v2(sku_master, loc_master, start_date, end_date, fest_df, we
         cross_sku_impacts[sku_id].append((sku_id, promo_flag))
         
         # Negative Binomial demand (overdispersion)
+        # Fix: Ensure expected is always positive to avoid invalid p values
+        expected_safe = np.maximum(expected, 0.1)  # Minimum expected demand of 0.1
+        
         r = 10  # Dispersion parameter
-        p = r / (r + expected)
+        p = r / (r + expected_safe)
+        
+        # Clip p to valid range [0, 1] to handle any edge cases
+        p = np.clip(p, 0.0001, 0.9999)
+        
         realized_demand = np.random.negative_binomial(r, p).astype(np.int32)
         realized_demand = np.maximum(realized_demand, 0)
         
@@ -747,10 +859,11 @@ def generate_enhanced_dataset(n_skus=N_SKUS, n_locs=N_LOCS, start_date=START_DAT
     macro_df = generate_monthly_macro(start_date, end_date)
     shock_df = generate_external_shocks(start_date, end_date)
     promo_calendar = generate_strategic_promotions(start_date, end_date, fest_df)
+    comp_df = generate_competitor_activity(start_date, end_date)
     
     # Core simulation
     daily_df = simulate_demand_v2(sku_master, loc_master, start_date, end_date,
-                                   fest_df, weather_df, macro_df, shock_df, promo_calendar)
+                                   fest_df, weather_df, macro_df, shock_df, promo_calendar, comp_df)
     daily_df = add_forecasting_features(daily_df)
     
     # Save outputs
@@ -763,6 +876,9 @@ def generate_enhanced_dataset(n_skus=N_SKUS, n_locs=N_LOCS, start_date=START_DAT
     daily_df.to_parquet(os.path.join(OUTPUT_DIR, 'daily_timeseries.parquet'), index=False)
     fest_df.to_parquet(os.path.join(OUTPUT_DIR, 'festival_calendar.parquet'), index=False)
     shock_df.to_parquet(os.path.join(OUTPUT_DIR, 'external_shocks.parquet'), index=False)
+    macro_df.to_parquet(os.path.join(OUTPUT_DIR, 'macro_indicators.parquet'), index=False)
+    weather_df.to_parquet(os.path.join(OUTPUT_DIR, 'weather_data.parquet'), index=False)
+    comp_df.to_parquet(os.path.join(OUTPUT_DIR, 'competitor_activity.parquet'), index=False)
     
     # Also save CSVs for compatibility
     daily_df.to_csv(os.path.join(OUTPUT_DIR, 'daily_timeseries.csv'), index=False)
