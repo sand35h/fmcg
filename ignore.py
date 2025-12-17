@@ -60,11 +60,6 @@ try:
 except ImportError:
     optuna = None
 
-try:
-    import shap
-except ImportError:
-    shap = None
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -185,21 +180,21 @@ class DataConfig:
 class ModelConfig:
     """Configuration for LightGBM model parameters."""
 
-    n_estimators: int = 5000
-    max_depth: int = -1  # No limit (controlled by num_leaves)
-    num_leaves: int = 256
-    learning_rate: float = 0.03
-    subsample: float = 0.7
-    colsample_bytree: float = 0.7
+    n_estimators: int = 3000
+    max_depth: int = 12
+    num_leaves: int = 128
+    learning_rate: float = 0.05
+    subsample: float = 0.8
+    colsample_bytree: float = 0.8
     reg_lambda: float = 1.0
     reg_alpha: float = 0.0
-    min_child_weight: int = 500
+    min_child_weight: int = 3
     gamma: float = 0.0
     random_state: int = 42
 
     # Training settings
-    early_stopping_rounds: int = 100
-    eval_metric: str = "None"  # Use custom WMAPE
+    early_stopping_rounds: int = 50
+    eval_metric: str = "rmse"
 
     # Device settings (auto-detect if None)
     use_gpu: Optional[bool] = None
@@ -288,63 +283,66 @@ class Metrics:
 
     @staticmethod
     def calculate(
-        y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "", 
-        weights: Optional[np.ndarray] = None
+        y_true: np.ndarray, y_pred: np.ndarray, prefix: str = ""
     ) -> Dict[str, float]:
         """
-        Calculate business-aligned forecasting metrics.
+        Calculate comprehensive forecasting metrics.
 
         Args:
             y_true: Actual values
             y_pred: Predicted values
-            prefix: Prefix for metric names
-            weights: Optional weights (e.g., revenue, ABC priority)
+            prefix: Prefix for metric names (e.g., 'train_', 'test_')
 
         Returns:
             Dictionary of metric names to values
         """
         y_true = np.asarray(y_true)
         y_pred = np.asarray(y_pred)
-        
-        # P2: Apply category-specific bias calibration (constrained to +5-8%)
-        # Prevents excessive inventory cost while maintaining service level
-        bias_factor = 1.06  # Default +6% for mixed categories
-        y_pred = y_pred * bias_factor
-        y_pred = np.clip(y_pred, 0, None)  # Ensure non-negative
-        
-        # Clip predictions to non-negative
-        y_pred = np.clip(y_pred, 0, None)
-        
-        # Default weights (uniform)
-        if weights is None:
-            weights = np.ones_like(y_true)
 
-        mae = mean_absolute_error(y_true, y_pred, sample_weight=weights)
-        rmse = np.sqrt(mean_squared_error(y_true, y_pred, sample_weight=weights))
-        r2 = r2_score(y_true, y_pred, sample_weight=weights)
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        r2 = r2_score(y_true, y_pred)
 
-        # P1: Revenue-weighted WMAPE (primary metric)
-        wmape = np.sum(weights * np.abs(y_true - y_pred)) / np.maximum(np.sum(weights * np.abs(y_true)), 1) * 100
+        # MAPE with protection against division by zero
+        denom = np.maximum(np.abs(y_true), 1)
+        mape = np.mean(np.abs((y_true - y_pred) / denom)) * 100
+
+        # Symmetric MAPE (more robust)
+        smape = (
+            100
+            * 2
+            * np.mean(
+                np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)
+            )
+        )
+
+        # Weighted MAPE (weighted by actual values) - Primary Metric
+        # Handles zeros well and weights high-volume items more
+        wmape = np.sum(np.abs(y_true - y_pred)) / np.maximum(np.sum(np.abs(y_true)), 1) * 100
 
         # Bias (positive = over-forecasting)
-        bias = np.sum(weights * (y_pred - y_true))
-        bias_pct = bias / np.maximum(np.sum(weights * np.abs(y_true)), 1) * 100
+        bias = np.mean(y_pred - y_true)
+        bias_pct = bias / np.maximum(np.mean(y_true), 1) * 100
         
-        # Service Level (inventory planning)
-        service_level = np.average(y_pred >= y_true, weights=weights) * 100
-        
-        # Stockout rate
-        stockout_rate = np.average(y_pred < y_true, weights=weights) * 100
+        # Service Level (approximate)
+        # Percentage of time prediction >= actual
+        service_level = np.mean(y_pred >= y_true) * 100
 
         metrics = {
-            f"{prefix}wmape": wmape,
             f"{prefix}mae": mae,
             f"{prefix}rmse": rmse,
             f"{prefix}r2": r2,
+            f"{prefix}mape": mape,
+            f"{prefix}smape": smape,
+            f"{prefix}wmape": wmape,
+            f"{prefix}bias": bias,
             f"{prefix}bias_pct": bias_pct,
             f"{prefix}service_level": service_level,
-            f"{prefix}stockout_rate": stockout_rate,
         }
+
+        # Format for logging
+        metrics_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        # logger.debug(f"Metrics ({prefix.strip('_')}): {metrics_str}")
 
         return metrics
 
@@ -358,19 +356,21 @@ class Metrics:
         
         # Helper to find key for a metric suffix
         def get_val(suffix: str) -> float:
+            # 1. Try exact match (e.g. "mae")
             if suffix in metrics: return metrics[suffix]
+            # 2. Try prefix match (e.g. "val_mae")
             for k in metrics:
                 if k.endswith(f"_{suffix}"): return metrics[k]
                 if k.endswith(suffix): return metrics[k]
             return 0.0
 
-        logger.info(f"WMAPE         : {get_val('wmape'):.2f}%  ⭐ PRIMARY")
-        logger.info(f"Service Level : {get_val('service_level'):.2f}%")
-        logger.info(f"Stockout Rate : {get_val('stockout_rate'):.2f}%")
-        logger.info(f"Bias          : {get_val('bias_pct'):+.2f}%  (Target: +5-10%)")
-        logger.info(f"MAE           : {get_val('mae'):,.1f}")
-        logger.info(f"RMSE          : {get_val('rmse'):,.1f}")
-        logger.info(f"R²            : {get_val('r2'):.4f}")
+        logger.info(f"MAE   : {get_val('mae'):,.3f}")
+        logger.info(f"RMSE  : {get_val('rmse'):,.3f}")
+        logger.info(f"R²    : {get_val('r2'):.4f}")
+        logger.info(f"MAPE  : {get_val('mape'):.2f}%")
+        logger.info(f"SMAPE : {get_val('smape'):.2f}%")
+        logger.info(f"WMAPE : {get_val('wmape'):.2f}%")
+        logger.info(f"Bias  : {get_val('bias_pct'):+.2f}%")
 
 
 # =============================================================================
@@ -387,7 +387,6 @@ class FeatureEngineer:
         self._location_df: Optional[pd.DataFrame] = None
         self._festival_df: Optional[pd.DataFrame] = None
         self._macro_df: Optional[pd.DataFrame] = None
-        self.weather_sensitive_categories = ['BEVERAGES', 'DAIRY', 'SNACKS']
 
     def load_reference_data(self) -> None:
         """Load reference/lookup tables with memory optimization."""
@@ -477,41 +476,50 @@ class FeatureEngineer:
         return out
 
     def add_shock_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add external shock features with impact multipliers."""
+        """Add external shock features."""
         if self._shock_df is None or "date" not in df.columns:
             return df
         
-        # Initialize with default values (no shock)
-        df["shock_demand_impact"] = np.float32(1.0)
-        df["shock_supply_impact"] = np.float32(1.0)
+        df["is_shock_event"] = np.int8(0)
         
-        # Apply shock impact multipliers
+        # Add binary flags for major shock types
         for _, row in self._shock_df.iterrows():
             mask = (df["date"] >= row["start"]) & (df["date"] <= row["end"])
             if mask.any():
-                df.loc[mask, "shock_demand_impact"] = np.float32(row["demand_impact"])
-                df.loc[mask, "shock_supply_impact"] = np.float32(row["supply_impact"])
+                df.loc[mask, "is_shock_event"] = np.int8(1)
         
         return df
 
     def add_macro_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Macro features EXCLUDED from daily forecasts (causes overfitting at daily granularity).
+        """Add macroeconomic indicators."""
+        if self._macro_df is None or "date" not in df.columns:
+            return df
         
-        Rationale:
-        - Monthly macro data creates step functions when merged to daily
-        - Causes spurious splits and early stopping
-        - Only useful for ≥30-day horizon models
-        - Daily demand driven by local factors (price, promo, weather)
-        """
-        logger.info("Skipping macro features for daily model (structural fix - prevents overfitting)")
+        macro = self._macro_df.copy()
+        if "month" in macro.columns:
+            macro["month"] = pd.to_datetime(macro["month"])
+            macro["_year"] = macro["month"].dt.year
+            macro["_month"] = macro["month"].dt.month
+            
+            # Select columns to merge
+            cols = ["_year", "_month", "gdp_growth", "cpi_index", "consumer_confidence"]
+            merge_cols = [c for c in cols if c in macro.columns]
+            
+            # Perform efficient merge via temp columns
+            temp_date = pd.DataFrame({'date': df['date'].unique()})
+            temp_date['_year'] = temp_date['date'].dt.year
+            temp_date['_month'] = temp_date['date'].dt.month
+            
+            macro_feats = temp_date.merge(macro[merge_cols], on=["_year", "_month"], how="left")
+            macro_feats.drop(columns=["_year", "_month"], inplace=True)
+            
+            out = df.merge(macro_feats, on="date", how="left")
+            return out
+            
         return df
 
     def add_weather_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add weather features GATED by category (prevents noise in non-sensitive products).
-        
-        Weather-sensitive categories: BEVERAGES, DAIRY, SNACKS, ICE_CREAM
-        Non-sensitive: HOMECARE, PERSONALCARE, NOODLES, BISCUITS (weather = 0)
-        """
+        """Add weather features."""
         if self._weather_df is None or "date" not in df.columns:
             return df
         
@@ -520,21 +528,6 @@ class FeatureEngineer:
         merge_cols = ["date"] + [c for c in weather_cols if c in weather.columns]
         
         out = df.merge(weather[merge_cols], on="date", how="left")
-        
-        # Gate weather by category (mask, not multiply)
-        if 'category' in out.columns:
-            for col in weather_cols:
-                if col in out.columns:
-                    masked_col = f"{col}_masked"
-                    out[masked_col] = np.where(
-                        out['category'].isin(self.weather_sensitive_categories),
-                        out[col],
-                        0.0  # Zero for non-sensitive categories
-                    ).astype(np.float32)
-                    # Drop ungated version to prevent leakage
-                    out = out.drop(columns=[col])
-        
-        logger.info(f"Added weather features (gated by category): {', '.join([c for c in weather_cols if c in weather.columns])}")
         return out
 
     def add_competitor_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -554,35 +547,42 @@ class FeatureEngineer:
         
         return out
 
-    def add_price_promo_features_v2(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add signal-rich price features (replaces noisy elasticity)."""
-        if not {"price", "base_price"}.issubset(df.columns):
+    def add_price_elasticity_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate price elasticity using rolling correlation."""
+        if not {"price", "actual_demand"}.issubset(df.columns):
             return df
         
-        logger.info("Adding price/promo features...")
+        logger.info("Calculating price elasticity features...")
         
-        df = df.sort_values(["sku_id", "location_id", "date"]).reset_index(drop=True)
+        # CRITICAL: Sort once before operations
+        df = df.sort_values(["sku_id", "location_id", "date"])
+        
+        # Calculate log price and log demand
+        df["log_price"] = np.log(df["price"] + 0.01)
+        df["log_demand"] = np.log(df["actual_demand"] + 1)
+        
+        # Create groupby once
         g = df.groupby(["sku_id", "location_id"], observed=True)
         
-        # Discount depth (direct signal)
-        df["discount_depth"] = (df["base_price"] - df["price"]) / df["base_price"].replace(0, np.nan)
-        df["discount_depth"] = df["discount_depth"].fillna(0).clip(0, 1).astype(np.float32)
+        # Fixed rolling correlation: calculate cross-correlation between price and demand
+        def rolling_corr(group):
+            corr_matrix = group[["log_price", "log_demand"]].rolling(30, min_periods=10).corr()
+            result = corr_matrix.unstack()["log_price"]["log_demand"]
+            # Replace inf/-inf with NaN for proper handling
+            return result.replace([np.inf, -np.inf], np.nan)
         
-        # Price change flag (binary)
-        price_shifted = g["price"].shift(7).values
-        df["price_changed"] = (price_shifted != df["price"].values).astype(np.int8)
+        df["price_elasticity"] = g.apply(rolling_corr, include_groups=False).reset_index(level=[0,1], drop=True).values
         
-        # Promo intensity (rolling) - FIX: reset_index to align
-        if "promo_flag" in df.columns:
-            promo_rolling = g["promo_flag"].rolling(7, min_periods=1).mean()
-            df["promo_intensity_7d"] = promo_rolling.reset_index(level=[0,1], drop=True).astype(np.float32)
+        # Create elasticity categories (handle NaN and clip extreme values)
+        df["price_elasticity"] = df["price_elasticity"].clip(-5, 5)  # Clip extreme values
+        df["elasticity_category"] = pd.cut(
+            df["price_elasticity"],
+            bins=[-np.inf, -0.7, -0.3, 0.3, np.inf],
+            labels=["Elastic", "Moderate", "Inelastic", "Positive"]
+        )
         
-        # Price volatility (30-day std) - FIX: reset_index to align
-        price_vol = g["price"].rolling(30, min_periods=5).std().fillna(0)
-        df["price_volatility_30d"] = price_vol.reset_index(level=[0,1], drop=True).astype(np.float32)
-        
-        # Price to base ratio
-        df["price_to_base"] = (df["price"] / df["base_price"].replace(0, np.nan)).fillna(1.0).astype(np.float32)
+        # Clean up
+        df = df.drop(columns=["log_price", "log_demand"])
         
         return df
 
@@ -633,16 +633,28 @@ class FeatureEngineer:
 
         return tmp
 
+    def add_price_promo_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add price and promotion features."""
+        tmp = df.copy()
 
+        if {"price", "base_price"}.issubset(tmp.columns):
+            tmp["price_to_base"] = tmp["price"] / tmp["base_price"].replace(0, np.nan)
+            tmp["price_to_base"] = tmp["price_to_base"].fillna(1.0)
 
-    def add_lag_features(self, df: pd.DataFrame, create_new: bool = False, horizon: str = 'short') -> pd.DataFrame:
+        if {"mrp", "price"}.issubset(tmp.columns):
+            tmp["discount_depth"] = (tmp["mrp"] - tmp["price"]) / tmp["mrp"].replace(0, np.nan)
+            tmp["discount_depth"] = tmp["discount_depth"].fillna(0).clip(-1, 1)
+            tmp["is_on_promo"] = (tmp["discount_depth"] > 0.05).astype(int)
+
+        return tmp
+
+    def add_lag_features(self, df: pd.DataFrame, create_new: bool = False) -> pd.DataFrame:
         """
-        P0: Add lag features with horizon-aware feature selection.
+        Add lag and rolling features with minimal memory usage.
         
         Args:
             df: Input dataframe
-            create_new: If True, create new lag features
-            horizon: 'short' (1-7d), 'mid' (8-30d), 'long' (31+d)
+            create_new: If True, create new lag features; if False, just validate existing ones
         """
         if not create_new:
             return df
@@ -651,39 +663,30 @@ class FeatureEngineer:
         if target not in df.columns:
             return df
             
-        logger.info(f"Generating lag features for target: {target} (horizon: {horizon})")
+        logger.info(f"Generating lag features for target: {target}")
 
         # CRITICAL: Sort once before all operations
         df = df.sort_values(["sku_id", "location_id", "date"])
         
-        # Create groupby once
+        # Create groupby once (performance optimization)
         g = df.groupby(["sku_id", "location_id"], observed=True)
         
-        # P0: Horizon-aware feature selection (prevents leakage)
-        if horizon == 'short':  # 1-7 days
-            lag_windows = [1, 7]
-            rolling_windows = [7]
-        elif horizon == 'mid':  # 8-30 days
-            lag_windows = [7, 14]
-            rolling_windows = [14, 28]
-        else:  # 31+ days
-            lag_windows = [30]
-            rolling_windows = [28, 90]
-        
         # Calculate lags
-        for lag in lag_windows:
+        for lag in [1, 7, 14, 30]:
             col_name = f"demand_lag_{lag}"
             logger.info(f"Creating {col_name}...")
             df[col_name] = g[target].shift(lag).astype(np.float32)
             gc.collect()
 
-        # Calculate rolling features
-        for window in rolling_windows:
+        # Calculate rolling features (FMCG-optimized windows: 14, 28)
+        for window in [14, 28]:
+            # Rolling Mean
             col_mean = f"demand_rolling_{window}_mean"
             logger.info(f"Creating {col_mean}...")
             df[col_mean] = g[target].shift(1).rolling(window, min_periods=1).mean().astype(np.float32)
             gc.collect()
             
+            # Coefficient of Variation (better than raw std for FMCG)
             col_cv = f"demand_rolling_{window}_cv"
             logger.info(f"Creating {col_cv}...")
             rolling_mean = g[target].shift(1).rolling(window, min_periods=1).mean()
@@ -751,15 +754,22 @@ class FeatureEngineer:
         df = reduce_mem_usage(df)
         gc.collect()
 
-        # 6. Price/Promo Features (v2 - replaces elasticity)
-        logger.info("Adding Price/Promo features v2...")
-        df = self.add_price_promo_features_v2(df)
+        # 6. Price/Promo Features
+        logger.info("Adding Price/Promo features...")
+        df = self.add_price_promo_features(df)
         df = reduce_mem_usage(df)
         gc.collect()
 
-        # 8. Lag Features (Most memory intensive) - P0: Horizon-aware
-        logger.info("Adding Lag features (short-horizon)...")
-        df = self.add_lag_features(df, create_new=True, horizon='short')
+        # 7. Price Elasticity Features
+        logger.info("Adding Price Elasticity features...")
+        df = self.add_price_elasticity_features(df)
+        df = reduce_mem_usage(df)
+        gc.collect()
+
+        # 8. Lag Features (Most memory intensive)
+        logger.info("Adding Lag features...")
+        df = self.add_lag_features(df, create_new=True)
+        # Note: add_lag_features already does internal GC/optimization now
         df = reduce_mem_usage(df)
         gc.collect()
 
@@ -770,12 +780,6 @@ class FeatureEngineer:
         del df
         gc.collect()
 
-        # P0: Exclude fully censored rows from training
-        if 'exclude_from_training' in result.columns:
-            before = len(result)
-            result = result[result['exclude_from_training'] == False]
-            logger.info(f"Excluded {before - len(result):,} fully censored rows")
-        
         # Drop rows with missing lag features
         lag_cols = [c for c in self.config.lag_cols if c in result.columns]
         if lag_cols:
@@ -789,13 +793,22 @@ class FeatureEngineer:
         result = reduce_mem_usage(result)
         gc.collect()
         
+        # Verify elasticity features were added
+        if "price_elasticity" in result.columns:
+            valid_elasticity = result["price_elasticity"].dropna()
+            if len(valid_elasticity) > 0:
+                logger.info(f"✅ Price Elasticity: {len(valid_elasticity)} valid calculations")
+                elastic_pct = (result["elasticity_category"] == "Elastic").sum() / len(result) * 100
+                logger.info(f"📊 {elastic_pct:.1f}% of products are price elastic")
+        
         # Feature diagnostics
         logger.info("\n=== FEATURE DIAGNOSTICS ===")
-        if "discount_depth" in result.columns:
-            logger.info(f"Discount depth - Mean: {result['discount_depth'].mean():.4f}")
-            logger.info(f"Promo days: {(result['discount_depth'] > 0.05).sum():,}")
-        if "promo_intensity_7d" in result.columns:
-            logger.info(f"Promo intensity - Mean: {result['promo_intensity_7d'].mean():.4f}")
+        if "price_elasticity" in result.columns:
+            logger.info(f"Price elasticity - Non-null: {result['price_elasticity'].notna().sum()}")
+            logger.info(f"Price elasticity - Mean: {result['price_elasticity'].mean():.4f}")
+            logger.info(f"Price elasticity - Std: {result['price_elasticity'].std():.4f}")
+        if "elasticity_category" in result.columns:
+            logger.info(f"Elasticity categories:\n{result['elasticity_category'].value_counts()}")
         
         return result
 
@@ -864,13 +877,10 @@ class FMCGTrainer:
         return "hist", "cpu"
 
     def _get_model_params(self) -> Dict[str, Any]:
-        """Build LightGBM parameters dict with Tweedie objective."""
+        """Build LightGBM parameters dict."""
         _, device = self._detect_device()
 
         params = {
-            "objective": "tweedie",
-            "tweedie_variance_power": 1.3,
-            "metric": "None",
             "n_estimators": self.model_config.n_estimators,
             "max_depth": self.model_config.max_depth,
             "num_leaves": self.model_config.num_leaves,
@@ -880,8 +890,6 @@ class FMCGTrainer:
             "reg_lambda": self.model_config.reg_lambda,
             "reg_alpha": self.model_config.reg_alpha,
             "min_child_weight": self.model_config.min_child_weight,
-            "max_bin": 512,
-            "bagging_freq": 1,
             "random_state": self.model_config.random_state,
             "n_jobs": -1,
             "device": device,
@@ -907,33 +915,6 @@ class FMCGTrainer:
 
         return feature_cols, df
 
-    def _rolling_origin_split(self, df: pd.DataFrame, n_origins: int = 3) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
-        """
-        Create rolling-origin validation splits for robust hyperparameter tuning.
-        
-        Returns:
-            List of (train_df, val_df) tuples
-        """
-        date_col = self.data_config.date_col
-        max_date = df[date_col].max()
-        
-        splits = []
-        for i in range(n_origins):
-            val_end = max_date - pd.Timedelta(days=365 * i)
-            val_start = val_end - pd.Timedelta(days=90)
-            train_end = val_start - pd.Timedelta(days=1)
-            
-            train_mask = df[date_col] < train_end
-            val_mask = (df[date_col] >= val_start) & (df[date_col] < val_end)
-            
-            train_df = df.loc[train_mask].copy()
-            val_df = df.loc[val_mask].copy()
-            
-            logger.info(f"Origin {i+1}: Train until {train_end.date()}, Val [{val_start.date()} - {val_end.date()}]")
-            splits.append((train_df, val_df))
-        
-        return splits
-
     def _time_split(
         self, df: pd.DataFrame
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -947,7 +928,7 @@ class FMCGTrainer:
         test_start = max_date - pd.Timedelta(days=self.training_config.test_days)
         val_start = test_start - pd.Timedelta(days=self.training_config.val_days)
 
-        logger.info(f"Split dates: Val start={val_start.date()}, Test start={test_start.date()}")
+        logger.info(f"Split dates: Val start={val_start}, Test start={test_start}")
 
         # Create masks
         train_mask = df[date_col] < val_start
@@ -996,9 +977,6 @@ class FMCGTrainer:
 
         logger.info(f"Loaded data: {len(df):,} rows")
 
-        # P0: Stockout correction (CRITICAL - do before feature engineering)
-        df = self._correct_stockout_censoring(df)
-
         # Load reference data for feature engineering
         self.feature_engineer.load_reference_data()
 
@@ -1011,56 +989,10 @@ class FMCGTrainer:
 
         return df
 
-    def _correct_stockout_censoring(self, df: pd.DataFrame) -> pd.DataFrame:
-        """P0: Correct censored demand from stockouts (±20% accuracy impact)."""
-        logger.info("\n=== P0: STOCKOUT CORRECTION ===")
-        
-        if 'stockout_flag' not in df.columns:
-            logger.warning("No stockout_flag found. Skipping correction.")
-            return df
-        
-        df = df.sort_values(['sku_id', 'location_id', 'date'])
-        g = df.groupby(['sku_id', 'location_id'], observed=True)
-        
-        # Calculate rolling velocity (7-day average before stockout)
-        velocity = g['actual_demand'].shift(1).rolling(7, min_periods=3).mean()
-        
-        # Exclude fully censored rows (opening_stock == 0)
-        fully_censored = (df.get('opening_stock', 0) == 0)
-        
-        # Impute partially censored (closing_stock == 0 and sales > 0)
-        partially_censored = (
-            (df['stockout_flag'] == 1) & 
-            (df.get('closing_stock', 1) == 0) &
-            (df['actual_demand'] > 0)
-        )
-        
-        # Create corrected target
-        df['true_demand'] = df['actual_demand'].copy()
-        df.loc[partially_censored, 'true_demand'] = np.maximum(
-            df.loc[partially_censored, 'actual_demand'],
-            velocity[partially_censored]
-        )
-        
-        # Mark rows to exclude from training
-        df['exclude_from_training'] = fully_censored
-        
-        n_excluded = fully_censored.sum()
-        n_corrected = partially_censored.sum()
-        logger.info(f"Excluded {n_excluded:,} fully censored rows (opening_stock=0)")
-        logger.info(f"Corrected {n_corrected:,} partially censored rows (stockout)")
-        logger.info(f"Correction impact: {(df['true_demand'].sum() / df['actual_demand'].sum() - 1) * 100:.1f}% demand increase")
-        
-        # Update target column
-        self.data_config.target_col = 'true_demand'
-        
-        return df
-
     def train(
         self,
         df: pd.DataFrame,
         feature_cols: Optional[List[str]] = None,
-        use_rolling_origin: bool = False,
     ) -> Dict[str, float]:
         """
         Train the LightGBM model.
@@ -1068,7 +1000,6 @@ class FMCGTrainer:
         Args:
             df: Prepared dataframe with features
             feature_cols: Optional list of feature columns to use
-            use_rolling_origin: If True, use rolling-origin validation for hyperparameter tuning
 
         Returns:
             Dictionary of training and test metrics
@@ -1087,24 +1018,7 @@ class FMCGTrainer:
         else:
             self.feature_cols = feature_cols
 
-        # Rolling-origin validation for hyperparameter tuning
-        if use_rolling_origin:
-            logger.info("Using rolling-origin validation for hyperparameter tuning...")
-            splits = self._rolling_origin_split(df, n_origins=3)
-            
-            # Train on each origin and average validation WMAPE
-            wmapes = []
-            for i, (train_df, val_df) in enumerate(splits):
-                logger.info(f"\n--- Training on Origin {i+1}/3 ---")
-                metrics = self._train_single_split(train_df, val_df)
-                wmapes.append(metrics["val_wmape"])
-                logger.info(f"Origin {i+1} Val WMAPE: {metrics['val_wmape']:.2f}%")
-            
-            avg_wmape = np.mean(wmapes)
-            logger.info(f"\n=== Average Validation WMAPE: {avg_wmape:.2f}% ===")
-            logger.info("Retraining on full data for final model...")
-        
-        # Time-based split for final model
+        # Time-based split
         train_df, val_df, test_df = self._time_split(df)
 
         target = self.data_config.target_col
@@ -1119,75 +1033,18 @@ class FMCGTrainer:
         del df
         gc.collect()
 
-        # Train final model
-        metrics = self._train_single_split(train_df, val_df, test_df)
-        
-        # Store all metrics
-        self.metrics_history["latest"] = metrics
-
-        # Save artifacts
-        self._save_artifacts(test_df, metrics["y_test"], metrics["y_test_pred"], metrics)
-
-        return metrics
-
-    def _train_single_split(
-        self,
-        train_df: pd.DataFrame,
-        val_df: pd.DataFrame,
-        test_df: Optional[pd.DataFrame] = None,
-    ) -> Dict[str, Any]:
-        """
-        Train model on a single train/val split.
-        
-        Args:
-            train_df: Training data
-            val_df: Validation data
-            test_df: Optional test data
-        
-        Returns:
-            Dictionary of metrics and predictions
-        """
-        import lightgbm as lgb
-        
-        target = self.data_config.target_col
-        X_train = train_df[self.feature_cols]
-        y_train = train_df[target]
-        X_val = val_df[self.feature_cols]
-        y_val = val_df[target]
-        
-        # Identify categorical columns
-        cat_cols = ["sku_id", "location_id", "category", "channel", "region", "brand", "segment"]
-        cat_cols = [c for c in cat_cols if c in self.feature_cols]
-        
-        # Convert to category dtype
-        for col in cat_cols:
-            if col in train_df.columns:
-                train_df[col] = train_df[col].astype("category")
-                val_df[col] = val_df[col].astype("category")
-                if test_df is not None and col in test_df.columns:
-                    test_df[col] = test_df[col].astype("category")
-        
-        # Custom WMAPE metric for early stopping
-        def wmape_lgb(y_pred, y_true):
-            y_true_arr = y_true.get_label()
-            y_pred_clipped = np.clip(y_pred, 0, None)
-            wmape = np.sum(np.abs(y_true_arr - y_pred_clipped)) / np.maximum(np.sum(np.abs(y_true_arr)), 1) * 100
-            return "wmape", wmape, False
-
         # Initialize model
         params = self._get_model_params()
         self.model = lgb.LGBMRegressor(**params)
 
-        # Train with early stopping on validation WMAPE
-        logger.info("Training LightGBM model with Tweedie loss...")
+        # Train with early stopping on validation set
+        logger.info("Training LightGBM model...")
         callbacks = [lgb.early_stopping(self.model_config.early_stopping_rounds, verbose=False)]
         self.model.fit(
             X_train,
             y_train,
             eval_set=[(X_val, y_val)],
-            eval_metric=wmape_lgb,
             callbacks=callbacks,
-            categorical_feature=cat_cols,
         )
 
         # Get best iteration
@@ -1195,111 +1052,33 @@ class FMCGTrainer:
         if best_iter:
             logger.info(f"Best iteration: {best_iter}")
 
-        # Generate predictions (clipping handled in Metrics.calculate)
-        y_train_pred = self.model.predict(X_train)
-        y_val_pred = self.model.predict(X_val)
+        # Generate predictions (clip to non-negative)
+        y_train_pred = np.maximum(self.model.predict(X_train), 0)
+        y_val_pred = np.maximum(self.model.predict(X_val), 0)
+        y_test_pred = np.maximum(self.model.predict(X_test), 0)
 
-        # P1: Calculate ABC-weighted metrics
-        train_weights = self._get_abc_weights(train_df) if 'abc_class' in train_df.columns else None
-        val_weights = self._get_abc_weights(val_df) if 'abc_class' in val_df.columns else None
-        
         # Calculate metrics
-        train_metrics = Metrics.calculate(y_train, y_train_pred, "train_", weights=train_weights)
-        val_metrics = Metrics.calculate(y_val, y_val_pred, "val_", weights=val_weights)
+        train_metrics = Metrics.calculate(y_train, y_train_pred, "train_")
+        val_metrics = Metrics.calculate(y_val, y_val_pred, "val_")
+        test_metrics = Metrics.calculate(y_test, y_test_pred, "test_")
 
         Metrics.log_metrics(train_metrics, "TRAIN")
         Metrics.log_metrics(val_metrics, "VAL")
+        Metrics.log_metrics(test_metrics, "TEST")
 
-        result = {**train_metrics, **val_metrics}
-        
-        # Test set evaluation (if provided)
-        if test_df is not None:
-            X_test = test_df[self.feature_cols]
-            y_test = test_df[target]
-            y_test_pred = self.model.predict(X_test)
-            
-            test_weights = self._get_abc_weights(test_df) if 'abc_class' in test_df.columns else None
-            test_metrics = Metrics.calculate(y_test, y_test_pred, "test_", weights=test_weights)
-            Metrics.log_metrics(test_metrics, "TEST")
-            
-            result.update(test_metrics)
-            result["y_test"] = y_test
-            result["y_test_pred"] = y_test_pred
-            
-            # Store feature importance (SHAP-based, not gain)
-            self.feature_importance = self._calculate_shap_importance(X_test.sample(min(1000, len(X_test))))
-            
-            logger.info("\n=== Top 15 Features (SHAP) ===")
-            logger.info(self.feature_importance.head(15).to_string(index=False))
-            
-            # Per-segment evaluation
-            self._evaluate_by_segment(test_df, y_test, y_test_pred)
-        
-        return result
+        # Store all metrics
+        all_metrics = {**train_metrics, **val_metrics, **test_metrics}
+        self.metrics_history["latest"] = all_metrics
 
-    def _calculate_shap_importance(self, X_sample: pd.DataFrame) -> pd.DataFrame:
-        """Calculate SHAP-based feature importance (more accurate than gain)."""
-        if shap is None:
-            logger.warning("SHAP not installed. Using gain-based importance.")
-            return pd.DataFrame({
-                "feature": self.feature_cols,
-                "importance": self.model.feature_importances_
-            }).sort_values("importance", ascending=False)
-        
-        try:
-            logger.info("Calculating SHAP feature importance...")
-            explainer = shap.TreeExplainer(self.model)
-            shap_values = explainer.shap_values(X_sample)
-            
-            importance_df = pd.DataFrame({
-                "feature": X_sample.columns,
-                "shap_importance": np.abs(shap_values).mean(axis=0)
-            }).sort_values("shap_importance", ascending=False)
-            
-            return importance_df
-        except Exception as e:
-            logger.warning(f"SHAP calculation failed: {e}. Using gain-based importance.")
-            return pd.DataFrame({
-                "feature": self.feature_cols,
-                "importance": self.model.feature_importances_
-            }).sort_values("importance", ascending=False)
+        # Store feature importance
+        self.feature_importance = pd.DataFrame(
+            {"feature": self.feature_cols, "importance": self.model.feature_importances_}
+        ).sort_values("importance", ascending=False)
 
-    def _get_abc_weights(self, df: pd.DataFrame) -> np.ndarray:
-        """P1: Get ABC-class weights for revenue-weighted metrics."""
-        abc_map = {'A': 3.0, 'B': 1.5, 'C': 1.0}
-        return df['abc_class'].map(abc_map).fillna(1.0).values
+        # Save artifacts
+        self._save_artifacts(test_df, y_test, y_test_pred, all_metrics)
 
-    def _evaluate_by_segment(self, df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -> None:
-        """Evaluate WMAPE by ABC class, category, and year."""
-        df = df.copy()
-        df["y_true"] = y_true
-        df["y_pred"] = np.clip(y_pred, 0, None)
-        df["abs_error"] = np.abs(df["y_true"] - df["y_pred"])
-        
-        # By ABC class
-        if "abc_class" in df.columns:
-            logger.info("\n=== WMAPE by ABC Class ===")
-            for abc in ["A", "B", "C"]:
-                mask = df["abc_class"] == abc
-                if mask.sum() > 0:
-                    wmape = df.loc[mask, "abs_error"].sum() / df.loc[mask, "y_true"].sum() * 100
-                    logger.info(f"{abc}-class: {wmape:.2f}%")
-        
-        # By category
-        if "category" in df.columns:
-            logger.info("\n=== WMAPE by Category (Top 5) ===")
-            for cat in df["category"].value_counts().head(5).index:
-                mask = df["category"] == cat
-                wmape = df.loc[mask, "abs_error"].sum() / df.loc[mask, "y_true"].sum() * 100
-                logger.info(f"{cat}: {wmape:.2f}%")
-        
-        # By year
-        if "date" in df.columns:
-            logger.info("\n=== WMAPE by Year ===")
-            for year in sorted(df["date"].dt.year.unique()):
-                mask = df["date"].dt.year == year
-                wmape = df.loc[mask, "abs_error"].sum() / df.loc[mask, "y_true"].sum() * 100
-                logger.info(f"{year}: {wmape:.2f}%")
+        return all_metrics
 
     def train_cv(
         self,
@@ -3331,10 +3110,10 @@ class TrainingPipeline:
         self.baseline_metrics = Metrics.calculate(y_val, y_val_pred, "baseline_")
         
         logger.info("\n--- BASELINE PERFORMANCE (Validation Set) ---")
-        logger.info(f"WMAPE: {self.baseline_metrics.get('baseline_wmape', 0):.2f}%")
-        logger.info(f"MAE:   {self.baseline_metrics['baseline_mae']:.2f}")
-        logger.info(f"RMSE:  {self.baseline_metrics['baseline_rmse']:.2f}")
-        logger.info(f"R²:    {self.baseline_metrics['baseline_r2']:.4f}")
+        logger.info(f"MAE:  {self.baseline_metrics['baseline_mae']:.2f}")
+        logger.info(f"RMSE: {self.baseline_metrics['baseline_rmse']:.2f}")
+        logger.info(f"MAPE: {self.baseline_metrics['baseline_mape']:.2f}%")
+        logger.info(f"R²:   {self.baseline_metrics['baseline_r2']:.4f}")
         
         if self.baseline_model.best_iteration_:
             logger.info(f"\nEarly stopping at iteration: {self.baseline_model.best_iteration_}")
@@ -3498,10 +3277,10 @@ class TrainingPipeline:
         self.tuning_metrics = Metrics.calculate(y_val, y_val_pred, "tuned_")
         
         logger.info("\n--- TUNED MODEL PERFORMANCE (Validation Set) ---")
-        logger.info(f"WMAPE: {self.tuning_metrics.get('tuned_wmape', 0):.2f}%")
-        logger.info(f"MAE:   {self.tuning_metrics['tuned_mae']:.2f}")
-        logger.info(f"RMSE:  {self.tuning_metrics['tuned_rmse']:.2f}")
-        logger.info(f"R²:    {self.tuning_metrics['tuned_r2']:.4f}")
+        logger.info(f"MAE:  {self.tuning_metrics['tuned_mae']:.2f}")
+        logger.info(f"RMSE: {self.tuning_metrics['tuned_rmse']:.2f}")
+        logger.info(f"MAPE: {self.tuning_metrics['tuned_mape']:.2f}%")
+        logger.info(f"R²:   {self.tuning_metrics['tuned_r2']:.4f}")
         
         # Compare with baseline
         improvement_mae = (
@@ -3686,9 +3465,11 @@ class TrainingPipeline:
         logger.info("\n" + "=" * 50)
         logger.info("FINAL MODEL PERFORMANCE (UNSEEN TEST SET)")
         logger.info("=" * 50)
-        logger.info(f"WMAPE: {self.final_metrics['test_wmape']:.2f}%  ⭐ PRIMARY")
         logger.info(f"MAE:   {self.final_metrics['test_mae']:,.2f}")
         logger.info(f"RMSE:  {self.final_metrics['test_rmse']:,.2f}")
+        logger.info(f"MAPE:  {self.final_metrics['test_mape']:.2f}%")
+        logger.info(f"SMAPE: {self.final_metrics['test_smape']:.2f}%")
+        logger.info(f"WMAPE: {self.final_metrics['test_wmape']:.2f}%")
         logger.info(f"R²:    {self.final_metrics['test_r2']:.4f}")
         logger.info(f"Bias:  {self.final_metrics['test_bias_pct']:+.2f}%")
         logger.info("=" * 50)
@@ -3763,7 +3544,7 @@ class TrainingPipeline:
             self.train_ensemble(use_gpu=True)
             
             # Mock empty tuning metrics for summary
-            self.tuning_metrics = {"tuned_mae": 0, "tuned_rmse": 0, "tuned_wmape": 0}
+            self.tuning_metrics = {"tuned_mae": 0, "tuned_rmse": 0, "tuned_mape": 0}
             
         else:
             # OPTION 2: Single XGBoost with Hyperparameter Tuning
@@ -3783,32 +3564,32 @@ class TrainingPipeline:
         logger.info("#" * 60)
         
         logger.info("\nMetrics Comparison:")
-        logger.info(f"{'Stage':<20} {'WMAPE':>10} {'MAE':>10} {'RMSE':>10} {'R²':>10}")
+        logger.info(f"{'Stage':<20} {'MAE':>10} {'RMSE':>10} {'MAPE':>10} {'WMAPE':>10}")
         logger.info("-" * 64)
         logger.info(
             f"{'Baseline (val)':<20} "
-            f"{self.baseline_metrics.get('baseline_wmape', 0):>9.2f}% "
             f"{self.baseline_metrics.get('baseline_mae', 0):>10.2f} "
             f"{self.baseline_metrics.get('baseline_rmse', 0):>10.2f} "
-            f"{self.baseline_metrics.get('baseline_r2', 0):>10.4f}"
+            f"{self.baseline_metrics.get('baseline_mape', 0):>9.2f}% "
+            f"{self.baseline_metrics.get('baseline_wmape', 0):>9.2f}%"
         )
         
         # Only show tuning metrics if tuning was actually performed
         if self.tuning_metrics and self.tuning_metrics.get('tuned_mae', 0) > 0:
             logger.info(
                 f"{'Tuned (val)':<20} "
-                f"{self.tuning_metrics.get('tuned_wmape', 0):>9.2f}% "
                 f"{self.tuning_metrics.get('tuned_mae', 0):>10.2f} "
                 f"{self.tuning_metrics.get('tuned_rmse', 0):>10.2f} "
-                f"{self.tuning_metrics.get('tuned_r2', 0):>10.4f}"
+                f"{self.tuning_metrics.get('tuned_mape', 0):>9.2f}% "
+                f"{self.tuning_metrics.get('tuned_wmape', 0):>9.2f}%"
             )
         
         logger.info(
             f"{'Final (test)':<20} "
-            f"{self.final_metrics.get('test_wmape', 0):>9.2f}% "
             f"{self.final_metrics.get('test_mae', 0):>10.2f} "
             f"{self.final_metrics.get('test_rmse', 0):>10.2f} "
-            f"{self.final_metrics.get('test_r2', 0):>10.4f}"
+            f"{self.final_metrics.get('test_mape', 0):>9.2f}% "
+            f"{self.final_metrics.get('test_wmape', 0):>9.2f}%"
         )
         
         return {
@@ -3851,11 +3632,6 @@ class TrainingPipeline:
         # Save metrics comparison
         metrics_data = {
             "stage": ["baseline_val", "tuned_val", "final_test"],
-            "wmape": [
-                self.baseline_metrics.get("baseline_wmape", 0),
-                self.tuning_metrics.get("tuned_wmape", 0),
-                self.final_metrics.get("test_wmape", 0),
-            ],
             "mae": [
                 self.baseline_metrics.get("baseline_mae", 0),
                 self.tuning_metrics.get("tuned_mae", 0),
@@ -3866,10 +3642,10 @@ class TrainingPipeline:
                 self.tuning_metrics.get("tuned_rmse", 0),
                 self.final_metrics.get("test_rmse", 0),
             ],
-            "r2": [
-                self.baseline_metrics.get("baseline_r2", 0),
-                self.tuning_metrics.get("tuned_r2", 0),
-                self.final_metrics.get("test_r2", 0),
+            "mape": [
+                self.baseline_metrics.get("baseline_mape", 0),
+                self.tuning_metrics.get("tuned_mape", 0),
+                self.final_metrics.get("test_mape", 0),
             ],
         }
         metrics_df = pd.DataFrame(metrics_data)
@@ -4070,10 +3846,10 @@ def main():
     print("TRAINING COMPLETE!")
     print("=" * 70)
     print(f"\nFinal Test Metrics:")
-    print(f"  WMAPE: {results['test_metrics']['test_wmape']:.2f}%  ⭐ PRIMARY")
-    print(f"  MAE:   {results['test_metrics']['test_mae']:,.2f}")
-    print(f"  RMSE:  {results['test_metrics']['test_rmse']:,.2f}")
-    print(f"  R²:    {results['test_metrics']['test_r2']:.4f}")
+    print(f"  MAE:  {results['test_metrics']['test_mae']:,.2f}")
+    print(f"  RMSE: {results['test_metrics']['test_rmse']:,.2f}")
+    print(f"  MAPE: {results['test_metrics']['test_mape']:.2f}%")
+    print(f"  R²:   {results['test_metrics']['test_r2']:.4f}")
     print(f"\nBest hyperparameters saved to: {data_config.output_root}")
     print(f"Plots saved to: {data_config.output_root / 'plots'}")
     
