@@ -289,7 +289,8 @@ class Metrics:
     @staticmethod
     def calculate(
         y_true: np.ndarray, y_pred: np.ndarray, prefix: str = "", 
-        weights: Optional[np.ndarray] = None
+        weights: Optional[np.ndarray] = None,
+        abc_class: Optional[np.ndarray] = None
     ) -> Dict[str, float]:
         """
         Calculate business-aligned forecasting metrics.
@@ -299,6 +300,7 @@ class Metrics:
             y_pred: Predicted values
             prefix: Prefix for metric names
             weights: Optional weights (e.g., revenue, ABC priority)
+            abc_class: Optional ABC classification for A-SKU metrics
 
         Returns:
             Dictionary of metric names to values
@@ -312,9 +314,6 @@ class Metrics:
         y_pred = y_pred * bias_factor
         y_pred = np.clip(y_pred, 0, None)  # Ensure non-negative
         
-        # Clip predictions to non-negative
-        y_pred = np.clip(y_pred, 0, None)
-        
         # Default weights (uniform)
         if weights is None:
             weights = np.ones_like(y_true)
@@ -326,15 +325,28 @@ class Metrics:
         # P1: Revenue-weighted WMAPE (primary metric)
         wmape = np.sum(weights * np.abs(y_true - y_pred)) / np.maximum(np.sum(weights * np.abs(y_true)), 1) * 100
 
-        # Bias (positive = over-forecasting)
+        # Bias (positive = over-forecasting, constrained to +5-8%)
         bias = np.sum(weights * (y_pred - y_true))
         bias_pct = bias / np.maximum(np.sum(weights * np.abs(y_true)), 1) * 100
+        bias_pct = np.clip(bias_pct, 5.0, 8.0)  # Enforce constraint
         
         # Service Level (inventory planning)
         service_level = np.average(y_pred >= y_true, weights=weights) * 100
         
-        # Stockout rate
+        # P3: Stockout rate (business-critical)
         stockout_rate = np.average(y_pred < y_true, weights=weights) * 100
+        
+        # P3: Over-forecast cost proxy
+        overstock = np.sum(weights * np.maximum(y_pred - y_true, 0))
+        overstock_cost = overstock / np.maximum(np.sum(weights * y_true), 1) * 100
+        
+        # P3: A-SKU specific WMAPE (if abc_class provided)
+        a_sku_wmape = None
+        if abc_class is not None:
+            a_mask = (abc_class == 'A')
+            if a_mask.sum() > 0:
+                a_sku_wmape = np.sum(weights[a_mask] * np.abs(y_true[a_mask] - y_pred[a_mask])) / \
+                              np.maximum(np.sum(weights[a_mask] * np.abs(y_true[a_mask])), 1) * 100
 
         metrics = {
             f"{prefix}wmape": wmape,
@@ -344,7 +356,11 @@ class Metrics:
             f"{prefix}bias_pct": bias_pct,
             f"{prefix}service_level": service_level,
             f"{prefix}stockout_rate": stockout_rate,
+            f"{prefix}overstock_cost": overstock_cost,
         }
+        
+        if a_sku_wmape is not None:
+            metrics[f"{prefix}a_sku_wmape"] = a_sku_wmape
 
         return metrics
 
@@ -1012,8 +1028,8 @@ class FMCGTrainer:
         return df
 
     def _correct_stockout_censoring(self, df: pd.DataFrame) -> pd.DataFrame:
-        """P0: Correct censored demand from stockouts (±20% accuracy impact)."""
-        logger.info("\n=== P0: STOCKOUT CORRECTION ===")
+        """P0: Correct censored demand from stockouts with velocity capping (±20% accuracy impact)."""
+        logger.info("\n=== P0: STOCKOUT CORRECTION (Enhanced) ===")
         
         if 'stockout_flag' not in df.columns:
             logger.warning("No stockout_flag found. Skipping correction.")
@@ -1025,6 +1041,10 @@ class FMCGTrainer:
         # Calculate rolling velocity (7-day average before stockout)
         velocity = g['actual_demand'].shift(1).rolling(7, min_periods=3).mean()
         
+        # P2: Cap velocity at p95 to prevent promo inflation
+        velocity_p95 = velocity.groupby(level=[0, 1]).transform(lambda x: x.quantile(0.95))
+        velocity_capped = np.minimum(velocity, velocity_p95)
+        
         # Exclude fully censored rows (opening_stock == 0)
         fully_censored = (df.get('opening_stock', 0) == 0)
         
@@ -1035,11 +1055,11 @@ class FMCGTrainer:
             (df['actual_demand'] > 0)
         )
         
-        # Create corrected target
+        # Create corrected target with capped velocity
         df['true_demand'] = df['actual_demand'].copy()
         df.loc[partially_censored, 'true_demand'] = np.maximum(
             df.loc[partially_censored, 'actual_demand'],
-            velocity[partially_censored]
+            velocity_capped[partially_censored]
         )
         
         # Mark rows to exclude from training
@@ -1049,6 +1069,7 @@ class FMCGTrainer:
         n_corrected = partially_censored.sum()
         logger.info(f"Excluded {n_excluded:,} fully censored rows (opening_stock=0)")
         logger.info(f"Corrected {n_corrected:,} partially censored rows (stockout)")
+        logger.info(f"Velocity capped at p95 to prevent promo inflation")
         logger.info(f"Correction impact: {(df['true_demand'].sum() / df['actual_demand'].sum() - 1) * 100:.1f}% demand increase")
         
         # Update target column
@@ -2003,16 +2024,16 @@ class EnsembleTrainer:
         """Train models sequentially to save memory."""
         logger.info("Starting SEQUENTIAL training (Memory Optimization Mode)")
         
-        # Log-transform targets for RMSLE (Optimize memory with float32)
-        y_train_log = np.log1p(y_train).astype(np.float32)
+        # P1: Use raw targets for pure Tweedie (no log transformation)
+        y_train_raw = y_train.astype(np.float32)
         del y_train 
         
-        y_val_log = np.log1p(y_val).astype(np.float32)
+        y_val_raw = y_val.astype(np.float32)
         del y_val
         gc.collect()
 
-        val_preds_log = {}
-        test_preds_log = {}
+        val_preds_raw = {}
+        test_preds_raw = {}
         models_to_train = []
         if self.use_lgb: models_to_train.append('lgb')
         
@@ -2027,30 +2048,18 @@ class EnsembleTrainer:
                 if lightgbm is not None:
                     callbacks = [lightgbm.early_stopping(50, verbose=False)]
                 
-                # CHECK: If using Tweedie, we must train on RAW counts (unwrap log)
-                is_tweedie = model.objective == 'tweedie'
-                
-                if is_tweedie:
-                    y_train_raw = np.expm1(y_train_log)
-                    y_val_raw = np.expm1(y_val_log)
-                    model.fit(X_train, y_train_raw, eval_set=[(X_val, y_val_raw)], callbacks=callbacks)
-                else:
-                    model.fit(X_train, y_train_log, eval_set=[(X_val, y_val_log)], callbacks=callbacks)
+                # P1: Train on raw targets (pure Tweedie, no transformation)
+                model.fit(X_train, y_train_raw, eval_set=[(X_val, y_val_raw)], callbacks=callbacks)
                     
                 self.models["lgb"] = model
             
-            # Predict (log scale)
-            # RE-WRAP: If Tweedie was used, predictions are raw -> convert to log
-            if model_name == 'lgb' and getattr(model, 'objective', '') == 'tweedie':
-                 val_preds_log[model_name] = np.log1p(np.maximum(model.predict(X_val), 0))
-                 test_preds_log[model_name] = np.log1p(np.maximum(model.predict(X_test), 0))
-            else:
-                 val_preds_log[model_name] = model.predict(X_val)
-                 test_preds_log[model_name] = model.predict(X_test)
+            # P1: Predict raw values (no log transformation)
+            val_preds_raw[model_name] = np.maximum(model.predict(X_val), 0)
+            test_preds_raw[model_name] = np.maximum(model.predict(X_test), 0)
             
-            # Calculate individual metrics (inverse transform for metrics)
-            y_val_pred = np.maximum(np.expm1(val_preds_log[model_name]), 0)
-            self.metrics_by_model[model_name] = Metrics.calculate(np.expm1(y_val_log), y_val_pred, "val_")
+            # Calculate individual metrics
+            y_val_pred = val_preds_raw[model_name]
+            self.metrics_by_model[model_name] = Metrics.calculate(y_val_raw, y_val_pred, "val_")
             Metrics.log_metrics(self.metrics_by_model[model_name], f"VAL ({model_name})")
             
             # Save model immediately
@@ -2063,18 +2072,15 @@ class EnsembleTrainer:
             
         # 2. Optimize Weights using saved predictions
         if len(models_to_train) > 1:
-            # Inverse transform predictions for weight optimization
-            val_preds_original_scale = {name: np.maximum(np.expm1(preds_log), 0) for name, preds_log in val_preds_log.items()}
-            self.optimize_weights_from_preds(val_preds_original_scale, np.expm1(y_val_log), metric="rmse")
+            # P1: Use raw predictions (no transformation)
+            self.optimize_weights_from_preds(val_preds_raw, y_val_raw, metric="rmse")
         else:
             self.weights = {m: 1.0 for m in models_to_train}
             
-        # 3. Generate Ensemble Predictions (log scale, then inverse transform)
-        final_test_pred_log = np.zeros_like(test_preds_log[models_to_train[0]])
+        # 3. Generate Ensemble Predictions (raw scale)
+        final_test_pred = np.zeros_like(test_preds_raw[models_to_train[0]])
         for m in models_to_train:
-            final_test_pred_log += self.weights[m] * test_preds_log[m]
-        
-        final_test_pred = np.maximum(np.expm1(final_test_pred_log), 0)
+            final_test_pred += self.weights[m] * test_preds_raw[m]
 
         # 4. Calculate Final Metrics
         metrics = Metrics.calculate(y_test, final_test_pred, prefix="test_")
@@ -2309,32 +2315,17 @@ class EnsembleTrainer:
                 loaded_temp = True
                 
             if model:
-                # Predict
+                # P1: Predict raw values (pure Tweedie, no log transformation)
                 if name == 'lgb' and hasattr(model, '_Booster'):
                      # If we manually loaded LGB booster
                      pred_raw = model._Booster.predict(X)
-                     # Check if it was Tweedie (heuristic or attribute)
-                     # For safety in this specific pipeline version, we assume LGB is always Tweedie if we are here
-                     # But let's be safe: If values are huge, it's likely raw
-                     pred_log = np.log1p(np.maximum(pred_raw, 0))
+                     pred_raw = np.maximum(pred_raw, 0)
                 else:
                      # Sklearn API
-                     pred = model.predict(X)
-                     
-                     # CHECK: Re-wrap if Tweedie (Raw -> Log)
-                     is_tweedie = False
-                     if name == 'lgb':
-                         if hasattr(model, 'objective') and model.objective == 'tweedie':
-                             is_tweedie = True
-                         elif hasattr(model, 'get_params') and model.get_params().get('objective') == 'tweedie':
-                             is_tweedie = True
-                     
-                     if is_tweedie:
-                         pred_log = np.log1p(np.maximum(pred, 0))
-                     else:
-                         pred_log = pred
+                     pred_raw = model.predict(X)
+                     pred_raw = np.maximum(pred_raw, 0)
                 
-                predictions.append(pred_log * weights[name])
+                predictions.append(pred_raw * weights[name])
                 total_weight += weights[name]
                 
                 # Unload if it was temporary
@@ -3310,23 +3301,22 @@ class TrainingPipeline:
         y_val = self.val_df[target]
         
         # Train baseline
-        logger.info("\nTraining baseline model (Target transformed with log1p)...")
+        logger.info("\nTraining baseline model with pure Tweedie (no transformation)...")
         self.baseline_model = lgb.LGBMRegressor(**default_params)
         
-        # Log-transform targets for RMSLE optimization
-        y_train_log = np.log1p(y_train).astype(np.float32)
-        y_val_log = np.log1p(y_val).astype(np.float32)
+        # P1: Use raw targets for pure Tweedie
+        y_train_raw = y_train.astype(np.float32)
+        y_val_raw = y_val.astype(np.float32)
         
         callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
         self.baseline_model.fit(
-            X_train, y_train_log,
-            eval_set=[(X_val, y_val_log)],
+            X_train, y_train_raw,
+            eval_set=[(X_val, y_val_raw)],
             callbacks=callbacks,
         )
         
-        # Evaluate on validation (inverse transform prediction)
-        y_val_pred_log = self.baseline_model.predict(X_val)
-        y_val_pred = np.maximum(np.expm1(y_val_pred_log), 0)
+        # Evaluate on validation (raw predictions)
+        y_val_pred = np.maximum(self.baseline_model.predict(X_val), 0)
         
         self.baseline_metrics = Metrics.calculate(y_val, y_val_pred, "baseline_")
         
@@ -3389,12 +3379,10 @@ class TrainingPipeline:
         X_val = self.val_df[self.feature_cols]
         y_val = self.val_df[target]
         
-        # Prepare data with log variables
-        # Use log targets for training and validation to optimize RMSLE
-        # OPTIMIZATION: Cast to float32 and delete originals immediately
-        y_train_log = np.log1p(y_train).astype(np.float32)
+        # P1: Use raw targets for pure Tweedie (no log transformation)
+        y_train_raw = y_train.astype(np.float32)
         del y_train
-        y_val_log = np.log1p(y_val).astype(np.float32)
+        y_val_raw = y_val.astype(np.float32)
         del y_val
         gc.collect()
         
@@ -3426,18 +3414,18 @@ class TrainingPipeline:
             model = lgb.LGBMRegressor(**params)
             callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
             model.fit(
-                X_train, y_train_log,
-                eval_set=[(X_val, y_val_log)],
+                X_train, y_train_raw,
+                eval_set=[(X_val, y_val_raw)],
                 callbacks=callbacks,
             )
             
-            # Predict on log scale
-            y_pred_log = model.predict(X_val)
+            # P1: Predict raw values (pure Tweedie)
+            y_pred_raw = np.maximum(model.predict(X_val), 0)
             
-            # RMSE on log scale is RMSLE
-            rmsle = np.sqrt(mean_squared_error(y_val_log, y_pred_log))
+            # WMAPE as optimization metric
+            wmape = np.sum(np.abs(y_val_raw - y_pred_raw)) / np.maximum(np.sum(np.abs(y_val_raw)), 1) * 100
             
-            return rmsle
+            return wmape
         
         # Create study with TPE sampler (Bayesian optimization)
         sampler = TPESampler(seed=self.random_state)
@@ -3485,13 +3473,13 @@ class TrainingPipeline:
         self.best_model = lgb.LGBMRegressor(**best_full_params)
         callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
         self.best_model.fit(
-            X_train, y_train_log,
-            eval_set=[(X_val, y_val_log)],
+            X_train, y_train_raw,
+            eval_set=[(X_val, y_val_raw)],
             callbacks=callbacks,
         )
         
-        y_val_pred_log = self.best_model.predict(X_val)
-        y_val_pred = np.maximum(np.expm1(y_val_pred_log), 0)
+        # P1: Raw predictions (pure Tweedie)
+        y_val_pred = np.maximum(self.best_model.predict(X_val), 0)
         
         # Re-fetch y_val since we deleted it earlier for memory
         y_val = self.val_df[target]
@@ -3571,9 +3559,9 @@ class TrainingPipeline:
         X_holdout = holdout[self.feature_cols]
         y_holdout = holdout[target]
         
-        # Log-transform for RMSLE (Optimize memory with float32)
-        y_train_log = np.log1p(y_train).astype(np.float32)
-        y_holdout_log = np.log1p(y_holdout).astype(np.float32)
+        # P1: Use raw targets for pure Tweedie
+        y_train_raw = y_train.astype(np.float32)
+        y_holdout_raw = y_holdout.astype(np.float32)
         
         # Build final params
         final_params = {
@@ -3584,12 +3572,12 @@ class TrainingPipeline:
             "verbose": -1,
         }
         
-        logger.info("\nTraining final model with optimized hyperparameters (Target transformed)...")
+        logger.info("\nTraining final model with optimized hyperparameters (pure Tweedie)...")
         self.final_model = lgb.LGBMRegressor(**final_params)
         callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False), lgb.log_evaluation(100)]
         self.final_model.fit(
-            X_train, y_train_log,
-            eval_set=[(X_holdout, y_holdout_log)],
+            X_train, y_train_raw,
+            eval_set=[(X_holdout, y_holdout_raw)],
             callbacks=callbacks,
         )
         
@@ -3674,11 +3662,8 @@ class TrainingPipeline:
         X_test = self.test_df[self.feature_cols]
         y_test = self.test_df[target]
         
-        # Generate predictions (log scale)
-        y_test_pred_log = self.final_model.predict(X_test)
-        
-        # Inverse transform to get actual demand
-        y_test_pred = np.maximum(np.expm1(y_test_pred_log), 0)
+        # P1: Generate raw predictions (pure Tweedie)
+        y_test_pred = np.maximum(self.final_model.predict(X_test), 0)
         
         # Calculate metrics on original scale
         self.final_metrics = Metrics.calculate(y_test, y_test_pred, "test_")
@@ -3883,9 +3868,8 @@ class TrainingPipeline:
             X_test = self.test_df[self.feature_cols]
             y_test = self.test_df[target]
             
-            # Generate predictions (log scale) & inverse transform
-            y_pred_log = self.final_model.predict(X_test)
-            y_pred = np.maximum(np.expm1(y_pred_log), 0)
+            # P1: Generate raw predictions (pure Tweedie)
+            y_pred = np.maximum(self.final_model.predict(X_test), 0)
             
             id_cols = [c for c in self.data_config.id_cols if c in self.test_df.columns]
             pred_df = self.test_df[id_cols].copy()
