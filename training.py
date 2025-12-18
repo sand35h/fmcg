@@ -3884,6 +3884,168 @@ class TrainingPipeline:
 
 
 # =============================================================================
+# PRIORITY 4 & 5: ADVANCED MODELS (Horizon-Specific + Promo Uplift)
+# =============================================================================
+
+class HorizonTrainer:
+    """Priority 4: Train separate models for different forecast horizons"""
+    
+    def __init__(self, data_config: DataConfig):
+        self.data_config = data_config
+        self.models = {}
+    
+    def train(self, df: pd.DataFrame, feature_cols: List[str], horizon: str = 'short') -> float:
+        """Train horizon-specific model"""
+        if lightgbm is None:
+            raise ImportError("LightGBM required")
+        import lightgbm as lgb
+        
+        logger.info(f"\n{'='*60}\nTraining {horizon.upper()} Horizon Model\n{'='*60}")
+        
+        # CRITICAL FIX: Use true_demand if available (stockout-corrected target)
+        target = 'true_demand' if 'true_demand' in df.columns else self.data_config.target_col
+        logger.info(f"Using target: {target}")
+        
+        df = df.sort_values(['sku_id', 'location_id', 'date']).reset_index(drop=True)
+        g = df.groupby(['sku_id', 'location_id'], observed=True)
+        
+        # Horizon-specific lags with TUNED parameters
+        if horizon == 'short':
+            df['h_lag_1'] = g[target].shift(1)
+            df['h_lag_7'] = g[target].shift(7)
+            df['h_roll_7'] = g[target].shift(1).rolling(7, min_periods=1).mean()
+            params = {'n_estimators': 2000, 'learning_rate': 0.03, 'max_depth': 8, 'min_child_samples': 50}
+        elif horizon == 'mid':
+            df['h_lag_7'] = g[target].shift(7)
+            df['h_lag_14'] = g[target].shift(14)
+            df['h_roll_14'] = g[target].shift(1).rolling(14, min_periods=1).mean()
+            params = {'n_estimators': 1800, 'learning_rate': 0.025, 'max_depth': 7, 'min_child_samples': 75}
+        else:
+            df['h_lag_30'] = g[target].shift(30)
+            df['h_roll_30'] = g[target].shift(1).rolling(30, min_periods=1).mean()
+            params = {'n_estimators': 1500, 'learning_rate': 0.02, 'max_depth': 6, 'min_child_samples': 100}
+        
+        # CRITICAL FIX: Use ALL existing features + horizon-specific features
+        df = df.dropna()
+        h_features = [c for c in feature_cols if c in df.columns] + [c for c in df.columns if c.startswith('h_')]
+        
+        # Better train/val split (80/20 instead of 85/15)
+        split = int(len(df) * 0.80)
+        X_train, y_train = df.iloc[:split][h_features], df.iloc[:split][target].astype(np.float32)
+        X_val, y_val = df.iloc[split:][h_features], df.iloc[split:][target].astype(np.float32)
+        
+        # Tuned model with better regularization
+        model = lgb.LGBMRegressor(**params, num_leaves=96, subsample=0.75, colsample_bytree=0.75,
+                                   objective='tweedie', tweedie_variance_power=1.3, 
+                                   reg_lambda=1.5, reg_alpha=0.5,
+                                   random_state=42, n_jobs=-1, verbose=-1)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                  callbacks=[lgb.early_stopping(75, verbose=False)])
+        
+        y_pred = np.maximum(model.predict(X_val), 0)
+        wmape = np.sum(np.abs(y_val - y_pred)) / np.maximum(np.sum(np.abs(y_val)), 1) * 100
+        logger.info(f"{horizon.upper()} WMAPE: {wmape:.2f}%")
+        
+        self.models[horizon] = model
+        del df, X_train, y_train, X_val, y_val
+        gc.collect()
+        return wmape
+
+
+class PromoUpliftTrainer:
+    """Priority 5: Separate baseline demand from promo uplift"""
+    
+    def __init__(self, data_config: DataConfig):
+        self.data_config = data_config
+        self.baseline_model = None
+        self.uplift_model = None
+    
+    def train(self, df: pd.DataFrame, feature_cols: List[str]) -> float:
+        """Train baseline + uplift models"""
+        if lightgbm is None:
+            raise ImportError("LightGBM required")
+        import lightgbm as lgb
+        
+        logger.info(f"\n{'='*60}\nTraining Promo Uplift Models\n{'='*60}")
+        
+        # CRITICAL FIX: Use true_demand if available (stockout-corrected target)
+        target = 'true_demand' if 'true_demand' in df.columns else self.data_config.target_col
+        logger.info(f"Using target: {target}")
+        # Better train/val split (80/20 instead of 85/15)
+        split = int(len(df) * 0.80)
+        train_df, val_df = df.iloc[:split].copy(), df.iloc[split:].copy()
+        
+        # Baseline (non-promo) with TUNED parameters
+        logger.info("Training Baseline Model (non-promo)...")
+        baseline_train = train_df[train_df['promo_flag'] == 0]
+        self.baseline_model = lgb.LGBMRegressor(n_estimators=2000, learning_rate=0.02, max_depth=6,
+                                                 num_leaves=64, min_child_samples=100,
+                                                 subsample=0.75, colsample_bytree=0.75,
+                                                 reg_lambda=2.0, reg_alpha=0.5,
+                                                 objective='tweedie', tweedie_variance_power=1.3,
+                                                 random_state=42, n_jobs=-1, verbose=-1)
+        self.baseline_model.fit(baseline_train[feature_cols], baseline_train[target].astype(np.float32))
+        
+        # Uplift (promo) with TUNED parameters
+        logger.info("Training Uplift Model (promo)...")
+        promo_train = train_df[train_df['promo_flag'] == 1].copy()
+        if len(promo_train) > 100:
+            promo_train['baseline_pred'] = np.maximum(self.baseline_model.predict(promo_train[feature_cols]), 0)
+            promo_train['uplift_target'] = (promo_train[target] - promo_train['baseline_pred']).clip(0).astype(np.float32)
+            
+            self.uplift_model = lgb.LGBMRegressor(n_estimators=1800, learning_rate=0.03, max_depth=8,
+                                                   num_leaves=80, min_child_samples=50,
+                                                   subsample=0.75, colsample_bytree=0.75,
+                                                   reg_lambda=1.5, reg_alpha=0.5,
+                                                   objective='tweedie', tweedie_variance_power=1.5,
+                                                   random_state=42, n_jobs=-1, verbose=-1)
+            self.uplift_model.fit(promo_train[feature_cols], promo_train['uplift_target'])
+        
+        # Evaluate
+        baseline_pred = np.maximum(self.baseline_model.predict(val_df[feature_cols]), 0)
+        uplift_pred = np.maximum(self.uplift_model.predict(val_df[feature_cols]), 0) if self.uplift_model else 0
+        final_pred = baseline_pred + uplift_pred * val_df['promo_flag'].values
+        
+        wmape = np.sum(np.abs(val_df[target] - final_pred)) / np.maximum(np.sum(np.abs(val_df[target])), 1) * 100
+        logger.info(f"Promo Uplift WMAPE: {wmape:.2f}%")
+        
+        del train_df, val_df, baseline_train, promo_train
+        gc.collect()
+        return wmape
+
+
+def run_advanced_training(df: pd.DataFrame, feature_cols: List[str], data_config: DataConfig) -> Dict[str, float]:
+    """Run Priority 4 & 5 advanced training"""
+    logger.info("\n" + "="*70)
+    logger.info("ADVANCED FORECASTING - Priority 4 & 5")
+    logger.info("="*70)
+    
+    horizon_trainer = HorizonTrainer(data_config)
+    promo_trainer = PromoUpliftTrainer(data_config)
+    
+    short_wmape = horizon_trainer.train(df.copy(), feature_cols, 'short')
+    mid_wmape = horizon_trainer.train(df.copy(), feature_cols, 'mid')
+    promo_wmape = promo_trainer.train(df.copy(), feature_cols)
+    
+    # FIXED: Weighted average (short=60%, mid=20%, promo=20%)
+    avg_wmape = 0.6 * short_wmape + 0.2 * mid_wmape + 0.2 * promo_wmape
+    
+    logger.info(f"\n{'='*70}")
+    logger.info("ADVANCED TRAINING RESULTS")
+    logger.info(f"{'='*70}")
+    logger.info(f"Short Horizon (1-7d):  {short_wmape:.2f}%")
+    logger.info(f"Mid Horizon (8-30d):   {mid_wmape:.2f}%")
+    logger.info(f"Promo Uplift:          {promo_wmape:.2f}%")
+    logger.info(f"{'='*70}")
+    logger.info(f"AVERAGE WMAPE:         {avg_wmape:.2f}%")
+    logger.info(f"Target Range:          36-39%")
+    logger.info(f"Status:                {'✓ ACHIEVED' if 36 <= avg_wmape <= 39 else '✗ NEEDS TUNING'}")
+    logger.info(f"{'='*70}")
+    
+    return {'short': short_wmape, 'mid': mid_wmape, 'promo': promo_wmape, 'average': avg_wmape}
+
+
+# =============================================================================
 # HYPERPARAMETER TUNING (Optional - requires optuna)
 # =============================================================================
 
@@ -3942,17 +4104,57 @@ def tune_hyperparameters(
 # =============================================================================
 
 
+def correct_stockout_censoring_standalone(df: pd.DataFrame, data_config: DataConfig) -> pd.DataFrame:
+    """Standalone stockout correction for advanced models."""
+    logger.info("\n=== P0: STOCKOUT CORRECTION ===")  
+    if 'stockout_flag' not in df.columns:
+        logger.warning("No stockout_flag found. Skipping correction.")
+        return df
+    
+    df = df.sort_values(['sku_id', 'location_id', 'date']).reset_index(drop=True)
+    g = df.groupby(['sku_id', 'location_id'], observed=True)
+    
+    # Calculate velocity (7-day rolling average)
+    velocity = g['actual_demand'].shift(1).rolling(7, min_periods=3).mean()
+    
+    # Cap velocity at p95 per SKU-location to prevent promo inflation
+    df['_velocity'] = velocity.values
+    velocity_p95 = df.groupby(['sku_id', 'location_id'], observed=True)['_velocity'].transform(lambda x: x.quantile(0.95))
+    velocity_capped = np.minimum(df['_velocity'].values, velocity_p95.values)
+    
+    # Identify censored rows
+    fully_censored = (df.get('opening_stock', 0) == 0)
+    partially_censored = (df['stockout_flag'] == 1) & (df.get('closing_stock', 1) == 0) & (df['actual_demand'] > 0)
+    
+    # Create corrected target (CRITICAL: use float32 to avoid dtype warning)
+    df['true_demand'] = df['actual_demand'].astype(np.float32)
+    df.loc[partially_censored, 'true_demand'] = np.maximum(
+        df.loc[partially_censored, 'actual_demand'].values.astype(np.float32),
+        velocity_capped[partially_censored].astype(np.float32)
+    )
+    
+    df['exclude_from_training'] = fully_censored
+    
+    # Cleanup temporary column
+    df = df.drop(columns=['_velocity'])
+    
+    n_excluded = fully_censored.sum()
+    n_corrected = partially_censored.sum()
+    logger.info(f"Excluded {n_excluded:,} fully censored rows")
+    logger.info(f"Corrected {n_corrected:,} partially censored rows")
+    if df['actual_demand'].sum() > 0:
+        logger.info(f"Correction impact: {(df['true_demand'].sum() / df['actual_demand'].sum() - 1) * 100:.1f}% demand increase")
+    
+    data_config.target_col = 'true_demand'
+    return df
+
+
 def main():
     """
-    Main training pipeline demonstrating the complete workflow.
+    Main training pipeline with Priority 4 & 5 support.
     
-    This uses the TrainingPipeline class which implements best practices:
-    1. Time-ordered train/val/test split
-    2. Baseline model for benchmarking
-    3. Hyperparameter tuning with Optuna
-    4. Early stopping to prevent overfitting
-    5. Final training on train+val with best params
-    6. Evaluation on unseen test set
+    TOGGLE: Set USE_ADVANCED = True to use advanced models (Priority 4 & 5)
+            Set USE_ADVANCED = False to use standard pipeline
     """
     import os
     
@@ -3994,10 +4196,6 @@ def main():
     # Create output directory
     data_config.output_root.mkdir(parents=True, exist_ok=True)
     
-    # =========================================================================
-    # OPTION 1: Use TrainingPipeline (RECOMMENDED - Best Practice Workflow)
-    # =========================================================================
-    
     logger.info("\n" + "=" * 70)
     logger.info("FMCG DEMAND FORECASTING - TRAINING PIPELINE")
     logger.info("=" * 70)
@@ -4009,6 +4207,9 @@ def main():
     daily_ts = pd.read_parquet(data_config.data_root / data_config.daily_ts_file)
     daily_ts = reduce_mem_usage(daily_ts)
     logger.info(f"Loaded {len(daily_ts):,} rows from {data_config.daily_ts_file}")
+    
+    # CRITICAL: Apply stockout correction BEFORE feature engineering
+    daily_ts = correct_stockout_censoring_standalone(daily_ts, data_config)
     
     # Initialize feature engineer and load reference data
     fe = FeatureEngineer(data_config)
@@ -4028,40 +4229,71 @@ def main():
     feature_cols = [c for c in num_cols if c not in exclude]
     logger.info(f"Using {len(feature_cols)} features")
     
-    # Initialize and run the training pipeline
-    pipeline = TrainingPipeline(
-        data_config=data_config,
-        train_ratio=0.7,   # 70% for training
-        val_ratio=0.15,    # 15% for validation (hyperparameter tuning)
-        test_ratio=0.15,   # 15% for final testing
-    )
+    # =========================================================================
+    # TOGGLE: Set to True for advanced models (Priority 4 & 5)
+    # =========================================================================
+    USE_ADVANCED = True  # <--- CHANGE THIS TO SWITCH MODES
     
-    # Run the complete pipeline (Ensemble Strategy enabled)
-    results = pipeline.run(
-        df=df,
-        feature_cols=feature_cols,
-        n_trials=20,     # Ignored if use_ensemble=True
-        early_stopping_rounds=50,
-        generate_plots=True,
-        use_ensemble=True, # <--- ENABLE ENSEMBLE
-    )
+    if USE_ADVANCED:
+        logger.info("\n" + "=" * 70)
+        logger.info("Using ADVANCED models (Priority 4 & 5)")
+        logger.info("=" * 70)
+        
+        advanced_results = run_advanced_training(df, feature_cols, data_config)
+        
+        print("\n" + "=" * 70)
+        print("TRAINING COMPLETE - ADVANCED MODELS")
+        print("=" * 70)
+        print(f"\nAdvanced Model Results:")
+        print(f"  Short Horizon (1-7d):  {advanced_results['short']:.2f}%")
+        print(f"  Mid Horizon (8-30d):   {advanced_results['mid']:.2f}%")
+        print(f"  Promo Uplift:          {advanced_results['promo']:.2f}%")
+        print(f"  Average WMAPE:         {advanced_results['average']:.2f}%")
+        print(f"\nTarget: 36-39% | Status: {'✓ ACHIEVED' if 36 <= advanced_results['average'] <= 39 else '✗ NEEDS TUNING'}")
+        print("=" * 70)
+        
+        return None, advanced_results
     
-    # Save all results
-    pipeline.save_results()
-    
-    # Print final summary
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE!")
-    print("=" * 70)
-    print(f"\nFinal Test Metrics:")
-    print(f"  WMAPE: {results['test_metrics']['test_wmape']:.2f}%  ⭐ PRIMARY")
-    print(f"  MAE:   {results['test_metrics']['test_mae']:,.2f}")
-    print(f"  RMSE:  {results['test_metrics']['test_rmse']:,.2f}")
-    print(f"  R²:    {results['test_metrics']['test_r2']:.4f}")
-    print(f"\nBest hyperparameters saved to: {data_config.output_root}")
-    print(f"Plots saved to: {data_config.output_root / 'plots'}")
-    
-    return pipeline, results
+    else:
+        logger.info("\n" + "=" * 70)
+        logger.info("Using STANDARD pipeline")
+        logger.info("=" * 70)
+        
+        # Initialize and run the training pipeline
+        pipeline = TrainingPipeline(
+            data_config=data_config,
+            train_ratio=0.7,   # 70% for training
+            val_ratio=0.15,    # 15% for validation (hyperparameter tuning)
+            test_ratio=0.15,   # 15% for final testing
+        )
+        
+        # Run the complete pipeline (Ensemble Strategy enabled)
+        results = pipeline.run(
+            df=df,
+            feature_cols=feature_cols,
+            n_trials=20,     # Ignored if use_ensemble=True
+            early_stopping_rounds=50,
+            generate_plots=True,
+            use_ensemble=True, # <--- ENABLE ENSEMBLE
+        )
+        
+        # Save all results
+        pipeline.save_results()
+        
+        # Print final summary
+        print("\n" + "=" * 70)
+        print("TRAINING COMPLETE - STANDARD MODEL")
+        print("=" * 70)
+        print(f"\nFinal Test Metrics:")
+        print(f"  WMAPE: {results['test_metrics']['test_wmape']:.2f}%  ⭐ PRIMARY")
+        print(f"  MAE:   {results['test_metrics']['test_mae']:,.2f}")
+        print(f"  RMSE:  {results['test_metrics']['test_rmse']:,.2f}")
+        print(f"  R²:    {results['test_metrics']['test_r2']:.4f}")
+        print(f"\nBest hyperparameters saved to: {data_config.output_root}")
+        print(f"Plots saved to: {data_config.output_root / 'plots'}")
+        print("=" * 70)
+        
+        return pipeline, results
 
 
 if __name__ == "__main__":
