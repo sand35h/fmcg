@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FMCG Demand Intelligence</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="app.js" defer></script>
+</head>
+
+<body>
+    <div class="min-h-screen">
+        <!-- Header -->
+        <header class="card rounded-none border-t-0 border-x-0 mb-6" style="border-radius: 0;">
+            <div class="p-4 flex justify-between items-center" style="max-width: 1400px; margin: 0 auto;">
+                <div class="flex items-center gap-3">
+                    <div class="kpi-icon primary" style="width: 40px; height: 40px;">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path
+                                d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z">
+                            </path>
+                            <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                            <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1 class="text-xl font-bold">Demand Intelligence</h1>
+                        <p class="text-xs text-muted mb-0">AI-Powered Forecasting System</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div id="apiStatus" class="badge">
+                        <span class="status-dot"></span>
+                        <span class="status-text">Connecting...</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main class="p-6" style="max-width: 1400px; margin: 0 auto;">
+            <!-- KPI Grid -->
+            <div class="grid grid-cols-4 gap-6 mb-8">
+                <div class="kpi-card info">
+                    <div class="kpi-label">H=1 Accuracy (WMAPE)</div>
+                    <div class="kpi-value" id="wmapeH1">--%</div>
+                    <div class="kpi-change positive">Target &lt; 35%</div>
+                </div>
+                <div class="kpi-card info">
+                    <div class="kpi-label">H=7 Accuracy (WMAPE)</div>
+                    <div class="kpi-value" id="wmapeH7">--%</div>
+                    <div class="kpi-change positive">Target &lt; 40%</div>
+                </div>
+                <div class="kpi-card info">
+                    <div class="kpi-label">H=14 Accuracy (WMAPE)</div>
+                    <div class="kpi-value" id="wmapeH14">--%</div>
+                    <div class="kpi-change positive">Target &lt; 45%</div>
+                </div>
+                <div class="kpi-card primary">
+                    <div class="kpi-label">Active Features</div>
+                    <div class="kpi-value" id="featureCount">--</div>
+                    <div class="text-xs text-muted mt-2">Engineered signals</div>
+                </div>
+            </div>
+
+            <!-- Main Content Area -->
+            <div class="grid grid-cols-3 gap-6">
+                <!-- Left: Forecast Control -->
+                <div class="card col-span-1">
+                    <div class="card-header">
+                        <h3 class="card-title">Generate Forecast</h3>
+                    </div>
+                    <form id="forecastForm">
+                        <div class="form-group">
+                            <label class="form-label flex items-center" for="skuId">
+                                SKU / Product
+                                <div class="tooltip">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                                        stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="12" y1="16" x2="12" y2="12"></line>
+                                        <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                    </svg>
+                                    <span class="tooltip-text">Select the product to forecast. Type to search by Name or
+                                        ID.</span>
+                                </div>
+                            </label>
+                            <input type="text" id="skuId" class="form-input" list="skuOptions"
+                                placeholder="Search product..." autocomplete="off" required>
+                            <datalist id="skuOptions"></datalist>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label flex items-center" for="locationId">
+                                Location
+                                <div class="tooltip">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                                        stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="12" y1="16" x2="12" y2="12"></line>
+                                        <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                    </svg>
+                                    <span class="tooltip-text">Select the warehouse or store location for the
+                                        forecast.</span>
+                                </div>
+                            </label>
+                            <input type="text" id="locationId" class="form-input" list="locOptions"
+                                placeholder="Search location..." required>
+                            <datalist id="locOptions"></datalist>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-4 mb-4">
+                            <div class="form-group mb-0">
+                                <label class="form-label flex items-center" for="date">
+                                    Target Date
+                                    <div class="tooltip">
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round">
+                                            <circle cx="12" cy="12" r="10"></circle>
+                                            <line x1="12" y1="16" x2="12" y2="12"></line>
+                                            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                        </svg>
+                                        <span class="tooltip-text">The date you want to predict demand for. Typically
+                                            tomorrow or next week.</span>
+                                    </div>
+                                </label>
+                                <input type="date" id="date" class="form-input" required>
+                            </div>
+                            <div class="form-group mb-0">
+                                <label class="form-label flex items-center" for="horizon">
+                                    Horizon
+                                    <div class="tooltip">
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round">
+                                            <circle cx="12" cy="12" r="10"></circle>
+                                            <line x1="12" y1="16" x2="12" y2="12"></line>
+                                            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                        </svg>
+                                        <span class="tooltip-text">How far in the future to predict. Affects model
+                                            selection (1, 7, or 14 days).</span>
+                                    </div>
+                                </label>
+                                <select id="horizon" class="form-select">
+                                    <option value="1">1 Day Ahead</option>
+                                    <option value="7">7 Days Ahead</option>
+                                    <option value="14">14 Days Ahead</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Scenario Controls -->
+                        <div class="border-t border-gray-700 pt-4 mb-6">
+                            <h4 class="text-xs font-bold text-muted uppercase tracking-wider mb-3">Scenario Simulation
+                            </h4>
+
+                            <div class="mb-4">
+                                <label class="form-label flex justify-between items-center">
+                                    <div class="flex items-center">
+                                        Price Adjustment
+                                        <div class="tooltip">
+                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                                                stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                stroke-linejoin="round">
+                                                <circle cx="12" cy="12" r="10"></circle>
+                                                <line x1="12" y1="16" x2="12" y2="12"></line>
+                                                <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                            </svg>
+                                            <span class="tooltip-text">Simulate the impact of changing the price on
+                                                demand (Price Elasticity).</span>
+                                        </div>
+                                    </div>
+                                    <span id="priceVal" class="text-xs font-mono text-primary-400">0%</span>
+                                </label>
+                                <input type="range" id="priceChange" min="-20" max="20" step="5" value="0"
+                                    class="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer">
+                                <div class="flex justify-between text-xs text-muted mt-1">
+                                    <span>-20%</span>
+                                    <span>0%</span>
+                                    <span>+20%</span>
+                                </div>
+                            </div>
+
+                            <div class="flex items-center gap-3 p-2 rounded-lg hover:bg-slate-800 transition-colors">
+                                <input type="checkbox" id="isPromo" class="w-4 h-4">
+                                <label for="isPromo" class="text-sm font-medium cursor-pointer flex items-center">
+                                    Active Promotion (+30% Lift)
+                                    <div class="tooltip">
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+                                            stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            stroke-linejoin="round">
+                                            <circle cx="12" cy="12" r="10"></circle>
+                                            <line x1="12" y1="16" x2="12" y2="12"></line>
+                                            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                        </svg>
+                                        <span class="tooltip-text">Simulate a marketing campaign effect (approx +30%
+                                            sales lift).</span>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary w-full justify-center">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                                fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                stroke-linejoin="round">
+                                <activity>
+                                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                                </activity>
+                                <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+                            </svg>
+                            Run Inference
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Middle/Right: Results & Analysis -->
+                <div class="col-span-2 flex flex-col gap-6">
+                    <!-- Prediction Result (Initially Hidden) -->
+                    <div id="resultCard" class="card hidden"
+                        style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.9) 100%); border: 1px solid var(--primary-500);">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <h3 class="text-lg font-medium text-muted mb-1">Forecast Prediction</h3>
+                                <div class="flex items-baseline gap-2">
+                                    <span id="predictionResult" class="text-4xl font-bold text-primary-400">--</span>
+                                    <span class="text-xl text-muted">units</span>
+                                </div>
+                                <div class="mt-2 text-sm">
+                                    Confidence Interval: <span id="confInterval"
+                                        class="font-mono text-success">--</span>
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <div class="badge badge-primary mb-2" id="resModel">Model v1.0</div>
+                                <div class="text-sm text-muted">
+                                    <div id="resHorizon">-- days out</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Inventory & Scenario Impact -->
+                        <div class="grid grid-cols-2 gap-4 mt-6 pt-4 border-t border-slate-700">
+                            <div class="p-3 rounded-lg bg-slate-900/50 border border-slate-700">
+                                <div class="text-xs text-muted mb-1">Inventory Status</div>
+                                <div class="flex items-center justify-between">
+                                    <span class="text-lg font-bold" id="currentStock">--</span>
+                                    <span class="badge" id="stockStatus">--</span>
+                                </div>
+                                <div class="text-xs text-muted mt-1" id="daysCover">-- days cover</div>
+                            </div>
+                            <div class="p-3 rounded-lg bg-slate-900/50 border border-slate-700">
+                                <div class="text-xs text-muted mb-1">Scenario Impact</div>
+                                <div class="text-lg font-bold" id="scenarioImpact">0%</div>
+                                <div class="text-xs text-muted mt-1">vs Baseline</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Feature Importance -->
+                    <div class="card flex-1">
+                        <div class="card-header">
+                            <h3 class="card-title">Model Explainability (Global)</h3>
+                        </div>
+                        <div style="height: 300px; position: relative;">
+                            <canvas id="featureChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <style>
+            .status-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background-color: var(--accent-warning);
+                display: inline-block;
+                margin-right: 6px;
+            }
+
+            .status-dot.connected {
+                background-color: var(--accent-success);
+                box-shadow: 0 0 8px var(--accent-success);
+            }
+
+            .status-dot.error {
+                background-color: var(--accent-danger);
+            }
+
+            .col-span-1 {
+                grid-column: span 1 / span 1;
+            }
+
+            .col-span-2 {
+                grid-column: span 2 / span 2;
+            }
+        </style>
+    </div>
+</body>
+
+</html>

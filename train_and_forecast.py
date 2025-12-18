@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-FMCG Training & Multi-Step Forecasting Pipeline
-================================================
+FMCG Training & Multi-Horizon Forecasting Pipeline
+===================================================
 Combined pipeline for:
-1. Training LightGBM baseline model with stockout correction
-2. Multi-step recursive forecasting (7/14 day horizons)
+1. Training LightGBM models for multiple forecast horizons (1, 7, 14 days)
+2. Stockout correction and feature engineering
+3. SHAP explainability and drift detection
+4. Business KPI measurement
 """
 
 import logging
@@ -17,6 +19,288 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# OPTIONAL DEPENDENCIES
+# =============================================================================
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    logger.info("SHAP not available - install with: pip install shap")
+
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+import json
+from datetime import datetime, timedelta
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for Kaggle
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# EMBEDDED: SHAP EXPLAINABILITY
+# =============================================================================
+
+def create_shap_report(model, X_train_sample, X_test_sample, feature_cols, output_dir):
+    """
+    Generate SHAP explainability report.
+    Embedded version for Kaggle compatibility.
+    """
+    if not SHAP_AVAILABLE:
+        logger.warning("SHAP not available - skipping explainability")
+        return None
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    
+    logger.info("Generating SHAP explainability report...")
+    
+    try:
+        # Create TreeExplainer
+        explainer = shap.TreeExplainer(model)
+        
+        # Calculate SHAP values for test sample
+        shap_values = explainer.shap_values(X_test_sample)
+        
+        # 1. Summary plot (beeswarm)
+        plt.figure(figsize=(12, 8))
+        shap.summary_plot(shap_values, X_test_sample, show=False, max_display=15)
+        plt.tight_layout()
+        plt.savefig(output_path / 'shap_summary.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved SHAP summary plot to {output_path / 'shap_summary.png'}")
+        
+        # 2. Feature importance bar plot
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values, X_test_sample, plot_type="bar", show=False, max_display=15)
+        plt.tight_layout()
+        plt.savefig(output_path / 'shap_importance.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved SHAP importance plot to {output_path / 'shap_importance.png'}")
+        
+        # 3. Calculate global feature importance from SHAP
+        shap_importance = np.abs(shap_values).mean(axis=0)
+        importance_df = pd.DataFrame({
+            'feature': feature_cols,
+            'shap_importance': shap_importance
+        }).sort_values('shap_importance', ascending=False)
+        importance_df.to_csv(output_path / 'shap_feature_importance.csv', index=False)
+        
+        logger.info("✓ SHAP explainability report complete")
+        return importance_df
+        
+    except Exception as e:
+        logger.warning(f"SHAP analysis failed: {e}")
+        return None
+
+# =============================================================================
+# EMBEDDED: DRIFT DETECTION
+# =============================================================================
+
+class DriftDetector:
+    """Detects data drift and concept drift."""
+    
+    def __init__(self, drift_threshold=0.15):
+        self.drift_threshold = drift_threshold
+        self.baseline_stats = {}
+        self.critical_features = []
+    
+    def capture_baseline(self, X_train, y_train, critical_features=None):
+        """Capture baseline statistics from training data."""
+        logger.info("Capturing baseline statistics for drift detection...")
+        
+        self.critical_features = critical_features if critical_features else X_train.columns.tolist()[:20]
+        
+        for col in self.critical_features:
+            if col in X_train.columns:
+                values = X_train[col].dropna()
+                self.baseline_stats[col] = {
+                    'mean': float(values.mean()),
+                    'std': float(values.std()) if values.std() > 0 else 1.0,
+                    'min': float(values.min()),
+                    'max': float(values.max()),
+                    'q25': float(values.quantile(0.25)),
+                    'q50': float(values.quantile(0.50)),
+                    'q75': float(values.quantile(0.75))
+                }
+        
+        # Target statistics
+        self.baseline_stats['__target__'] = {
+            'mean': float(y_train.mean()),
+            'std': float(y_train.std()) if y_train.std() > 0 else 1.0
+        }
+        
+        logger.info(f"✓ Baseline captured for {len(self.baseline_stats)} features")
+    
+    def detect_data_drift(self, X_new):
+        """Detect data drift using statistical measures."""
+        logger.info(f"Analyzing data drift for {len(X_new)} new samples...")
+        
+        drift_results = {}
+        drifted_features = []
+        
+        for col in self.critical_features:
+            if col not in X_new.columns or col not in self.baseline_stats:
+                continue
+            
+            baseline = self.baseline_stats[col]
+            current_values = X_new[col].dropna()
+            
+            if len(current_values) < 10:
+                continue
+            
+            # Mean shift (normalized)
+            mean_shift = abs(current_values.mean() - baseline['mean']) / (baseline['std'] + 1e-6)
+            
+            # Std shift (normalized)
+            std_shift = abs(current_values.std() - baseline['std']) / (baseline['std'] + 1e-6)
+            
+            # Combined drift score
+            drift_score = (mean_shift + std_shift) / 2
+            
+            drift_results[col] = {
+                'drift_score': float(drift_score),
+                'is_drifted': drift_score > self.drift_threshold
+            }
+            
+            if drift_results[col]['is_drifted']:
+                drifted_features.append(col)
+        
+        overall_drift = np.mean([r['drift_score'] for r in drift_results.values()]) if drift_results else 0
+        
+        logger.info(f"Overall drift score: {overall_drift:.3f} (threshold: {self.drift_threshold})")
+        if drifted_features:
+            logger.warning(f"Drifted features: {drifted_features[:5]}")
+        
+        return {
+            'overall_drift': overall_drift,
+            'drifted_features': drifted_features,
+            'needs_attention': overall_drift > self.drift_threshold
+        }
+    
+    def save_baseline(self, filepath):
+        """Save baseline statistics to file."""
+        baseline_data = {
+            'baseline_stats': self.baseline_stats,
+            'critical_features': self.critical_features,
+            'drift_threshold': self.drift_threshold,
+            'timestamp': datetime.now().isoformat()
+        }
+        with open(filepath, 'w') as f:
+            json.dump(baseline_data, f, indent=2)
+        logger.info(f"✓ Baseline saved to {filepath}")
+    
+    def load_baseline(self, filepath):
+        """Load baseline statistics from file."""
+        with open(filepath, 'r') as f:
+            baseline_data = json.load(f)
+        self.baseline_stats = baseline_data['baseline_stats']
+        self.critical_features = baseline_data['critical_features']
+        self.drift_threshold = baseline_data['drift_threshold']
+        logger.info(f"✓ Baseline loaded from {filepath}")
+
+# =============================================================================
+# EMBEDDED: BUSINESS KPI MEASUREMENT
+# =============================================================================
+
+class BusinessKPICalculator:
+    """Compares ML forecasts against baseline methods."""
+    
+    def __init__(self, lead_time_days=7, service_level=0.95):
+        self.lead_time_days = lead_time_days
+        self.service_level = service_level
+    
+    def calculate_baseline_forecasts(self, df):
+        """Generate baseline forecasts for comparison."""
+        df = df.sort_values(['sku_id', 'location_id', 'date']).reset_index(drop=True)
+        
+        # Moving average forecast
+        df['ma_forecast'] = df.groupby(['sku_id', 'location_id'])['actual_demand'].transform(
+            lambda x: x.shift(1).rolling(7, min_periods=1).mean()
+        )
+        
+        # Naive forecast (last value)
+        df['naive_forecast'] = df.groupby(['sku_id', 'location_id'])['actual_demand'].shift(1)
+        
+        return df
+    
+    def compare_methods(self, ml_forecasts, actual_df):
+        """Compare ML forecasts against baseline methods."""
+        logger.info("\n" + "="*70)
+        logger.info("BUSINESS KPI COMPARISON: ML vs. BASELINE")
+        logger.info("="*70)
+        
+        # Merge forecasts with actuals
+        df = ml_forecasts.merge(
+            actual_df[['date', 'sku_id', 'location_id', 'actual_demand']],
+            on=['date', 'sku_id', 'location_id'],
+            how='inner'
+        )
+        
+        # Add baseline forecasts
+        df = self.calculate_baseline_forecasts(df)
+        
+        # Calculate metrics for each method
+        methods = {
+            'ML Forecast': 'forecast',
+            'Moving Avg (7d)': 'ma_forecast', 
+            'Naive (t-1)': 'naive_forecast'
+        }
+        
+        results = {}
+        for name, col in methods.items():
+            if col not in df.columns:
+                continue
+            
+            valid = df[col].notna()
+            y_true = df.loc[valid, 'actual_demand']
+            y_pred = df.loc[valid, col]
+            
+            wmape = np.sum(np.abs(y_true - y_pred)) / np.maximum(np.sum(np.abs(y_true)), 1) * 100
+            mae = mean_absolute_error(y_true, y_pred)
+            
+            results[name] = {'wmape': wmape, 'mae': mae}
+        
+        # Print comparison
+        logger.info(f"\n{'Method':<20} {'WMAPE':>10} {'MAE':>10}")
+        logger.info("-" * 42)
+        for name, metrics in results.items():
+            logger.info(f"{name:<20} {metrics['wmape']:>9.2f}% {metrics['mae']:>10.2f}")
+        
+        # Calculate improvement
+        if 'ML Forecast' in results and 'Moving Avg (7d)' in results:
+            ml_wmape = results['ML Forecast']['wmape']
+            baseline_wmape = results['Moving Avg (7d)']['wmape']
+            improvement = ((baseline_wmape - ml_wmape) / baseline_wmape) * 100
+            
+            logger.info("\n" + "="*70)
+            logger.info(f"📊 ML improves WMAPE by {improvement:.1f}% vs Moving Average")
+            if improvement >= 20:
+                logger.info("✓ Meets target: 20-25% improvement")
+            else:
+                logger.info(f"⚠ Below target (need 20-25% improvement)")
+        
+        return results
+    
+    def export_report(self, results, output_path):
+        """Export KPI report to file."""
+        with open(output_path, 'w') as f:
+            f.write("="*70 + "\n")
+            f.write("BUSINESS KPI REPORT\n")
+            f.write("="*70 + "\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            for method, metrics in results.items():
+                f.write(f"{method}:\n")
+                f.write(f"  WMAPE: {metrics['wmape']:.2f}%\n")
+                f.write(f"  MAE: {metrics['mae']:.2f}\n\n")
+        
+        logger.info(f"✓ KPI report saved to {output_path}")
 
 # =============================================================================
 # CONFIGURATION
@@ -325,8 +609,169 @@ def train_baseline(df, feature_cols):
     }
 
 # =============================================================================
-# MULTI-STEP FORECASTING
+# MULTI-HORIZON MODEL TRAINING
 # =============================================================================
+
+def train_horizon_models(df, feature_cols, horizons=[1, 7, 14]):
+    """
+    Train separate models for each forecast horizon.
+    
+    Args:
+        df: Processed DataFrame with features
+        feature_cols: List of feature column names
+        horizons: List of forecast horizons (days ahead)
+    
+    Returns:
+        Dictionary with models and results for each horizon
+    """
+    logger.info("\n" + "="*70)
+    logger.info("TRAINING MULTI-HORIZON MODELS")
+    logger.info("="*70)
+    
+    all_results = {}
+    
+    # Time-based split: 70% train, 15% val, 15% test
+    df_sorted = df.sort_values(['sku_id', 'location_id', 'date']).reset_index(drop=True)
+    
+    for h in horizons:
+        logger.info(f"\n{'='*70}")
+        logger.info(f"TRAINING HORIZON h={h} MODEL")
+        logger.info(f"{'='*70}")
+        
+        # Create horizon-shifted target
+        df_h = df_sorted.copy()
+        df_h[f'target_h{h}'] = df_h.groupby(['sku_id', 'location_id'], observed=True)[TARGET_COL].shift(-h)
+        
+        # Drop rows without target (end of each series)
+        df_h = df_h.dropna(subset=[f'target_h{h}']).reset_index(drop=True)
+        
+        # Time-based split
+        df_h = df_h.sort_values('date').reset_index(drop=True)
+        n = len(df_h)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+        
+        train_df = df_h.iloc[:train_end]
+        val_df = df_h.iloc[train_end:val_end]
+        test_df = df_h.iloc[val_end:]
+        
+        logger.info(f"Train: {len(train_df):,} rows")
+        logger.info(f"Val:   {len(val_df):,} rows")
+        logger.info(f"Test:  {len(test_df):,} rows")
+        
+        # Prepare data
+        target_col_h = f'target_h{h}'
+        X_train, y_train = train_df[feature_cols], train_df[target_col_h].astype(np.float32)
+        X_val, y_val = val_df[feature_cols], val_df[target_col_h].astype(np.float32)
+        X_test, y_test = test_df[feature_cols], test_df[target_col_h].astype(np.float32)
+        
+        # Model parameters
+        params = {
+            'objective': 'tweedie',
+            'tweedie_variance_power': 1.3,
+            'metric': 'None',
+            'n_estimators': 3000,
+            'learning_rate': 0.03,
+            'num_leaves': 128,
+            'max_depth': 8,
+            'min_child_samples': 100,
+            'subsample': 0.75,
+            'colsample_bytree': 0.75,
+            'reg_lambda': 1.0,
+            'reg_alpha': 0.5,
+            'random_state': 42,
+            'n_jobs': -1,
+            'verbose': -1
+        }
+        
+        # Train model
+        logger.info(f"\nTraining h={h} model...")
+        model = lgb.LGBMRegressor(**params)
+        
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            eval_metric='mae',
+            callbacks=[lgb.early_stopping(100, verbose=False)]
+        )
+        
+        logger.info(f"Best iteration: {model.best_iteration_}")
+        
+        # Evaluate
+        y_test_pred = np.clip(model.predict(X_test), 0, None)
+        test_wmape = calculate_wmape(y_test, y_test_pred)
+        test_mae = mean_absolute_error(y_test, y_test_pred)
+        
+        logger.info(f"h={h} Test WMAPE: {test_wmape:.2f}%")
+        logger.info(f"h={h} Test MAE:   {test_mae:.2f}")
+        
+        # Save model
+        model_path = OUTPUT_ROOT / f'model_h{h}.txt'
+        model.booster_.save_model(str(model_path))
+        logger.info(f"Saved model to {model_path}")
+        
+        # Store results
+        all_results[h] = {
+            'model': model,
+            'test_wmape': test_wmape,
+            'test_mae': test_mae,
+            'X_train': X_train,
+            'X_test': X_test,
+            'y_test': y_test,
+            'y_pred': y_test_pred,
+            'test_df': test_df
+        }
+        
+        # Generate SHAP explainability for h=1 model (primary)
+        if h == 1 and SHAP_AVAILABLE:
+            logger.info("\nGenerating SHAP explainability report...")
+            try:
+                shap_output = OUTPUT_ROOT / 'shap_output'
+                shap_output.mkdir(exist_ok=True)
+                create_shap_report(
+                    model=model,
+                    X_train_sample=X_train.sample(min(1000, len(X_train)), random_state=42),
+                    X_test_sample=X_test.sample(min(500, len(X_test)), random_state=42),
+                    feature_cols=feature_cols,
+                    output_dir=str(shap_output)
+                )
+            except Exception as e:
+                logger.warning(f"SHAP explainability failed: {e}")
+    
+    # Capture drift baseline using h=1 model's training data
+    logger.info("\n" + "="*70)
+    logger.info("CAPTURING DRIFT DETECTION BASELINE")
+    logger.info("="*70)
+    try:
+        detector = DriftDetector(drift_threshold=0.15)
+        detector.capture_baseline(
+            all_results[1]['X_train'], 
+            all_results[1]['y_test'],
+            critical_features=feature_cols[:20]  # Top 20 features
+        )
+        detector.save_baseline(str(OUTPUT_ROOT / 'drift_baseline.json'))
+    except Exception as e:
+        logger.warning(f"Drift baseline capture failed: {e}")
+    
+    # Save feature importance (from h=1 model)
+    fi = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': all_results[1]['model'].feature_importances_
+    }).sort_values('importance', ascending=False)
+    fi.to_csv(OUTPUT_ROOT / 'feature_importance.csv', index=False)
+    
+    # Summary
+    logger.info("\n" + "="*70)
+    logger.info("MULTI-HORIZON TRAINING COMPLETE")
+    logger.info("="*70)
+    for h in horizons:
+        logger.info(f"  h={h:2d} day: WMAPE = {all_results[h]['test_wmape']:.2f}%")
+    logger.info("="*70)
+    
+    return all_results
+
+# =============================================================================
+# MULTI-STEP FORECASTING
 
 def recursive_forecast(model, initial_data, feature_cols, horizon=7):
     """
@@ -503,15 +948,21 @@ def run_multistep_forecasting(model, df, feature_cols):
 # MAIN PIPELINE
 # =============================================================================
 
-def main(run_forecast=True):
+def main():
     """
     Main training and forecasting pipeline.
     
-    Args:
-        run_forecast: If True, also run multi-step forecasting after training
+    Trains:
+    - 3 horizon-specific models (h=1, h=7, h=14)
+    - 1 baseline model for backward compatibility
+    
+    Integrates:
+    - SHAP explainability (if available)
+    - Drift detection baseline capture
+    - Business KPI measurement
     
     Returns:
-        Dictionary with training results and optionally forecast results
+        Dictionary with all training results and metrics
     """
     logger.info("="*70)
     logger.info("FMCG TRAINING & FORECASTING PIPELINE")
@@ -549,23 +1000,37 @@ def main(run_forecast=True):
     logger.info(f"Target: {TARGET_COL}")
     
     # -------------------------------------------------------------------------
-    # STEP 5: TRAIN MODEL
+    # STEP 5: TRAIN MULTI-HORIZON MODELS
     # -------------------------------------------------------------------------
+    horizon_results = train_horizon_models(df, feature_cols, horizons=[1, 7, 14])
+    
+    # Also train baseline for backward compatibility
     train_results = train_baseline(df, feature_cols)
     
     # -------------------------------------------------------------------------
-    # STEP 6: MULTI-STEP FORECASTING (OPTIONAL)
+    # STEP 6: BUSINESS KPI MEASUREMENT
     # -------------------------------------------------------------------------
-    forecast_results = None
-    eval_results = None
-    
-    if run_forecast:
-        forecasts, eval_results = run_multistep_forecasting(
-            train_results['model'], 
-            df, 
-            feature_cols
-        )
-        forecast_results = forecasts
+    kpi_results = None
+    logger.info("\n" + "="*70)
+    logger.info("BUSINESS KPI MEASUREMENT")
+    logger.info("="*70)
+    try:
+        # Prepare forecast DataFrame
+        h1_results = horizon_results[1]
+        ml_forecasts = h1_results['test_df'][['date', 'sku_id', 'location_id']].copy()
+        ml_forecasts['forecast'] = h1_results['y_pred']
+        
+        # Prepare actuals DataFrame
+        actuals = h1_results['test_df'][['date', 'sku_id', 'location_id', TARGET_COL]].copy()
+        actuals = actuals.rename(columns={TARGET_COL: 'actual_demand'})
+        
+        # Calculate KPIs
+        kpi_calc = BusinessKPICalculator(lead_time_days=7, service_level=0.95)
+        kpi_comparison = kpi_calc.compare_methods(ml_forecasts, actuals)
+        kpi_calc.export_report(kpi_comparison, str(OUTPUT_ROOT / 'business_kpi_report.txt'))
+        kpi_results = kpi_comparison
+    except Exception as e:
+        logger.warning(f"Business KPI measurement failed: {e}")
     
     # -------------------------------------------------------------------------
     # FINAL SUMMARY
@@ -573,25 +1038,26 @@ def main(run_forecast=True):
     logger.info("\n" + "="*70)
     logger.info("PIPELINE COMPLETE")
     logger.info("="*70)
-    logger.info(f"Test WMAPE: {train_results['test_wmape']:.2f}%")
+    
+    logger.info("\nMulti-Horizon Model Results:")
+    for h in [1, 7, 14]:
+        if h in horizon_results:
+            logger.info(f"  h={h:2d} day: WMAPE = {horizon_results[h]['test_wmape']:.2f}%")
+    
+    logger.info(f"\nBaseline (h=1) WMAPE: {train_results['test_wmape']:.2f}%")
     logger.info(f"Target: 35-40% (Acceptable: <45%)")
     
     if train_results['test_wmape'] < 45:
-        logger.info("✓ ACCEPTABLE - Ready for hyperparameter tuning")
+        logger.info("✓ ACCEPTABLE - Ready for production")
     else:
         logger.info("✗ NEEDS INVESTIGATION - Check data/features")
-    
-    if eval_results is not None and len(eval_results) > 0:
-        logger.info("\nMulti-Step Forecast Summary:")
-        for _, row in eval_results.iterrows():
-            logger.info(f"  {int(row['horizon']):2d}-day WMAPE: {row['wmape']:.2f}%")
     
     logger.info("="*70)
     
     return {
         'train_results': train_results,
-        'forecasts': forecast_results,
-        'eval_results': eval_results,
+        'horizon_results': horizon_results,
+        'kpi_results': kpi_results,
         'processed_df': df,
         'feature_cols': feature_cols
     }
@@ -647,8 +1113,8 @@ def forecast_only():
 if __name__ == "__main__":
     # For Colab/Jupyter: Just call the function directly
     # Options:
-    #   results = main(run_forecast=True)   # Train + Forecast (default)
-    #   results = main(run_forecast=False)  # Train only
-    #   forecasts, eval_results = forecast_only()  # Forecast only (needs pre-trained model)
+    #   results = main()              # Full pipeline: multi-horizon models + KPIs
+    #   forecasts = forecast_only()   # Forecast using pre-trained models
     
-    results = main(run_forecast=True)
+    results = main()
+
