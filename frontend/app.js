@@ -238,6 +238,9 @@ function showPrediction(result) {
 
     // Scroll to result
     document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
+
+    // Start Live Stream
+    startLiveUpdates(result.sku_id, result.location_id);
 }
 
 async function loadProducts(query = '') {
@@ -280,6 +283,122 @@ async function loadLocations() {
     }
 }
 
+async function loadCategories() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/categories`);
+        if (!response.ok) return;
+        const data = await response.json();
+
+        const select = document.getElementById('catalogCategory');
+        if (!select) return;
+
+        select.innerHTML = '';
+        data.categories.forEach(cat => {
+            const option = document.createElement('option');
+            option.value = cat;
+            option.textContent = cat;
+            select.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Failed to load categories:', error);
+    }
+}
+
+async function searchCatalog() {
+    const query = document.getElementById('catalogSearch').value;
+    const category = document.getElementById('catalogCategory').value;
+    const grid = document.getElementById('catalogGrid');
+
+    grid.innerHTML = '<div class="col-span-full py-12 text-center"><div class="spinner mx-auto mb-2"></div>Searching...</div>';
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/products?query=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`);
+        if (!response.ok) return;
+        const data = await response.json();
+
+        grid.innerHTML = '';
+        if (data.products.length === 0) {
+            grid.innerHTML = '<div class="col-span-full py-12 text-center text-muted">No products found matching your criteria.</div>';
+            return;
+        }
+
+        data.products.forEach(p => {
+            const card = document.createElement('div');
+            card.className = 'catalog-card animate-fadeIn';
+            card.innerHTML = `
+                <div class="text-xs font-bold text-primary-400 mb-1">${p.category}</div>
+                <div class="font-bold text-white mb-1 truncate">${p.name}</div>
+                <div class="text-xs text-muted mb-3">${p.brand} | ${p.sku_id}</div>
+                <button class="btn btn-secondary w-full select-product" data-id="${p.sku_id}" data-name="${p.name}">Select</button>
+            `;
+
+            card.querySelector('.select-product').addEventListener('click', () => {
+                document.getElementById('skuId').value = p.sku_id;
+                closeCatalog();
+                // Trigger auto-load for the selected product
+                loadProducts(p.sku_id);
+            });
+
+            grid.appendChild(card);
+        });
+    } catch (error) {
+        console.error('Catalog search failed:', error);
+        grid.innerHTML = '<div class="col-span-full py-12 text-center text-danger">Search failed. Check your connection.</div>';
+    }
+}
+
+async function loadInventoryDashboard() {
+    const locationId = document.getElementById('locationId').value;
+    if (!locationId) return;
+
+    const tbody = document.querySelector('#inventoryTable tbody');
+    tbody.innerHTML = '<tr><td colspan="7" class="p-8 text-center"><div class="spinner mx-auto mb-2"></div>Loading latest intelligence...</td></tr>';
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/inventory/dashboard?location_id=${locationId}`);
+        if (!response.ok) throw new Error('Failed to load dashboard');
+        const data = await response.json();
+
+        tbody.innerHTML = '';
+        data.items.forEach(item => {
+            const tr = document.createElement('tr');
+            const statusClass = item.status === 'Critical' ? 'status-critical' : (item.status === 'Warning' ? 'status-warning' : 'status-healthy');
+
+            tr.innerHTML = `
+                <td class="p-4">${item.name}<br><small class="text-xs text-muted">${item.sku_id}</small></td>
+                <td class="p-4"><span class="badge font-normal text-xs">${item.category}</span></td>
+                <td class="p-4 font-mono">${item.stock.toLocaleString()}</td>
+                <td class="p-4 font-mono text-primary-400">${item.forecast_7d.toLocaleString()}</td>
+                <td class="p-4 font-mono">${item.days_of_cover}d</td>
+                <td class="p-4"><span class="${statusClass}">${item.status}</span></td>
+                <td class="p-4"><button class="btn btn-secondary px-2 py-1 text-xs restock-btn" data-sku="${item.sku_id}">${item.recommendation}</button></td>
+            `;
+
+            // Interaction: click recommendation to select product
+            tr.querySelector('.restock-btn').addEventListener('click', () => {
+                document.getElementById('skuId').value = item.sku_id;
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+                loadProducts(item.sku_id);
+            });
+
+            tbody.appendChild(tr);
+        });
+    } catch (error) {
+        console.error('Dashboard load failed:', error);
+        tbody.innerHTML = '<tr><td colspan="7" class="p-8 text-center text-danger">Failed to load inventory intelligence.</td></tr>';
+    }
+}
+
+function openCatalog() {
+    document.getElementById('catalogModal').classList.remove('hidden');
+    loadCategories();
+    searchCatalog();
+}
+
+function closeCatalog() {
+    document.getElementById('catalogModal').classList.add('hidden');
+}
+
 // =============================================================================
 // EVENT HANDLERS
 // =============================================================================
@@ -293,6 +412,20 @@ document.getElementById('skuId').addEventListener('input', (e) => {
     }, 300);
 });
 
+// Catalog Search
+document.getElementById('browseCatalog').addEventListener('click', openCatalog);
+document.getElementById('closeCatalog').addEventListener('click', closeCatalog);
+
+document.getElementById('catalogSearch').addEventListener('input', () => {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(searchCatalog, 300);
+});
+
+document.getElementById('catalogCategory').addEventListener('change', searchCatalog);
+
+// Inventory Dashboard Trigger
+document.getElementById('locationId').addEventListener('change', loadInventoryDashboard);
+
 // Slider visual update
 document.getElementById('priceChange').addEventListener('input', (e) => {
     const val = e.target.value;
@@ -300,6 +433,59 @@ document.getElementById('priceChange').addEventListener('input', (e) => {
     document.getElementById('priceVal').className = 'text-xs font-mono ' +
         (val > 0 ? 'text-success' : (val < 0 ? 'text-danger' : 'text-primary-400'));
 });
+
+// Simulator & Live Updates
+let pollInterval = null;
+
+function startLiveUpdates(skuId, locationId) {
+    if (pollInterval) clearInterval(pollInterval);
+
+    // Show live weather badge
+    const weatherBadge = document.getElementById('resWeather');
+    if (weatherBadge) weatherBadge.classList.remove('hidden');
+
+    pollInterval = setInterval(async () => {
+        try {
+            const res = await fetch(`${API_BASE_URL}/inventory/status?sku_id=${skuId}&location_id=${locationId}`);
+            if (res.ok) {
+                const data = await res.json();
+                const stockEl = document.getElementById('currentStock');
+                // parse current value
+                const currentVal = parseInt(stockEl.textContent.replace(/,/g, '')) || 0;
+                const newVal = data.current_stock;
+
+                if (newVal !== currentVal) {
+                    // Update
+                    stockEl.textContent = newVal.toLocaleString();
+
+                    // Animation: Flash Red if dropping
+                    if (newVal < currentVal) {
+                        stockEl.style.color = '#ef4444'; // Red-500
+                        stockEl.style.transition = 'color 0.2s';
+                        setTimeout(() => stockEl.style.color = '', 500);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error("Polling error", e);
+        }
+    }, 2000); // 2 seconds
+}
+
+// Sim Toggle
+const simToggle = document.getElementById('simToggle');
+if (simToggle) {
+    simToggle.addEventListener('change', async (e) => {
+        const endpoint = e.target.checked ? '/simulate/start' : '/simulate/stop';
+        try {
+            await fetch(`${API_BASE_URL}${endpoint}`, { method: 'POST' });
+        } catch (err) {
+            console.error(err);
+            e.target.checked = !e.target.checked;
+            alert("Failed to toggle simulator. Check API.");
+        }
+    });
+}
 
 elements.forecastForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -337,6 +523,11 @@ async function init() {
 
     const features = await getFeatureImportance(15);
     updateFeatureChart(features);
+
+    // Initial dashboard load if a location is selected
+    if (document.getElementById('locationId').value) {
+        loadInventoryDashboard();
+    }
 }
 
 document.addEventListener('DOMContentLoaded', init);

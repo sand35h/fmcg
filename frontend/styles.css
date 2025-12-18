@@ -1078,3 +1078,82 @@ a:hover {
   opacity: 1;
   bottom: 135%;
 }
+
+/* =============================================================================
+   Modals
+   ============================================================================= */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  animation: fadeIn 0.2s ease-out;
+}
+
+.modal-container {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-xl);
+  width: 100%;
+  max-width: 900px;
+  padding: var(--space-6);
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  animation: slideUp 0.3s ease-out;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* Catalog Card */
+.catalog-card {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.catalog-card:hover {
+  border-color: var(--primary-500);
+  transform: translateY(-2px);
+  background: var(--bg-primary);
+}
+
+/* Table */
+table {
+  border-collapse: collapse;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--border-primary);
+}
+
+tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.status-critical {
+  color: var(--accent-danger);
+  font-weight: 600;
+}
+
+.status-warning {
+  color: var(--accent-warning);
+  font-weight: 600;
+}
+
+.status-healthy {
+  color: var(--accent-success);
+  font-weight: 600;
+}

@@ -88,9 +88,36 @@
                                         ID.</span>
                                 </div>
                             </label>
-                            <input type="text" id="skuId" class="form-input" list="skuOptions"
-                                placeholder="Search product..." autocomplete="off" required>
+                            <div class="flex gap-2">
+                                <input type="text" id="skuId" class="form-input" list="skuOptions"
+                                    placeholder="Search product..." autocomplete="off" required>
+                                <button type="button" id="browseCatalog" class="btn btn-secondary px-3"
+                                    title="Browse Catalog">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round">
+                                        <circle cx="11" cy="11" r="8"></circle>
+                                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                                    </svg>
+                                </button>
+                            </div>
                             <datalist id="skuOptions"></datalist>
+                        </div>
+
+                        <!-- Simulation Control -->
+                        <div class="bg-slate-800/50 p-4 rounded-lg mb-6 border border-slate-700">
+                            <div class="flex justify-between items-center">
+                                <div>
+                                    <div class="text-sm font-bold text-white">Buying Simulator</div>
+                                    <div class="text-xs text-muted">Drain inventory automatically</div>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="simToggle" class="sr-only peer">
+                                    <div
+                                        class="w-9 h-5 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary-500">
+                                    </div>
+                                </label>
+                            </div>
                         </div>
 
                         <div class="form-group">
@@ -104,14 +131,14 @@
                                         <line x1="12" y1="16" x2="12" y2="12"></line>
                                         <line x1="12" y1="8" x2="12.01" y2="8"></line>
                                     </svg>
-                                    <span class="tooltip-text">Select the warehouse or store location for the
-                                        forecast.</span>
+                                    <span class="tooltip-text">Select warehouse/store location.</span>
                                 </div>
                             </label>
                             <input type="text" id="locationId" class="form-input" list="locOptions"
                                 placeholder="Search location..." required>
                             <datalist id="locOptions"></datalist>
                         </div>
+
 
                         <div class="grid grid-cols-2 gap-4 mb-4">
                             <div class="form-group mb-0">
@@ -125,7 +152,8 @@
                                             <line x1="12" y1="16" x2="12" y2="12"></line>
                                             <line x1="12" y1="8" x2="12.01" y2="8"></line>
                                         </svg>
-                                        <span class="tooltip-text">The date you want to predict demand for. Typically
+                                        <span class="tooltip-text">The date you want to predict demand for.
+                                            Typically
                                             tomorrow or next week.</span>
                                     </div>
                                 </label>
@@ -142,7 +170,8 @@
                                             <line x1="12" y1="16" x2="12" y2="12"></line>
                                             <line x1="12" y1="8" x2="12.01" y2="8"></line>
                                         </svg>
-                                        <span class="tooltip-text">How far in the future to predict. Affects model
+                                        <span class="tooltip-text">How far in the future to predict. Affects
+                                            model
                                             selection (1, 7, or 14 days).</span>
                                     </div>
                                 </label>
@@ -156,7 +185,8 @@
 
                         <!-- Scenario Controls -->
                         <div class="border-t border-gray-700 pt-4 mb-6">
-                            <h4 class="text-xs font-bold text-muted uppercase tracking-wider mb-3">Scenario Simulation
+                            <h4 class="text-xs font-bold text-muted uppercase tracking-wider mb-3">Scenario
+                                Simulation
                             </h4>
 
                             <div class="mb-4">
@@ -171,7 +201,8 @@
                                                 <line x1="12" y1="16" x2="12" y2="12"></line>
                                                 <line x1="12" y1="8" x2="12.01" y2="8"></line>
                                             </svg>
-                                            <span class="tooltip-text">Simulate the impact of changing the price on
+                                            <span class="tooltip-text">Simulate the impact of changing the price
+                                                on
                                                 demand (Price Elasticity).</span>
                                         </div>
                                     </div>
@@ -198,7 +229,8 @@
                                             <line x1="12" y1="16" x2="12" y2="12"></line>
                                             <line x1="12" y1="8" x2="12.01" y2="8"></line>
                                         </svg>
-                                        <span class="tooltip-text">Simulate a marketing campaign effect (approx +30%
+                                        <span class="tooltip-text">Simulate a marketing campaign effect (approx
+                                            +30%
                                             sales lift).</span>
                                     </div>
                                 </label>
@@ -237,8 +269,22 @@
                                 </div>
                             </div>
                             <div class="text-right">
-                                <div class="badge badge-primary mb-2" id="resModel">Model v1.0</div>
-                                <div class="text-sm text-muted">
+                                <div class="flex flex-col items-end gap-1">
+                                    <div class="badge badge-primary" id="resModel">Model v1.0</div>
+                                    <div class="badge bg-blue-900 text-blue-200 border-blue-700 hidden" id="resWeather">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12"
+                                            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                            stroke-linecap="round" stroke-linejoin="round" class="mr-1">
+                                            <path d="M17.5 19c0-1.7-1.3-3-3-3h-9c-1.7 0-3 1.3-3 3"></path>
+                                            <path d="M14 16v-2a2 2 0 0 0-2-2h-3a2 2 0 0 0-2 2v2"></path>
+                                            <path d="M8 9a4 4 0 0 1 8 0"></path>
+                                            <line x1="12" y1="3" x2="12" y2="5"></line>
+                                            <line x1="12" y1="13" x2="12" y2="16"></line>
+                                        </svg>
+                                        Live Weather
+                                    </div>
+                                </div>
+                                <div class="text-sm text-muted mt-1">
                                     <div id="resHorizon">-- days out</div>
                                 </div>
                             </div>
@@ -273,7 +319,71 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Full Width: Inventory Intelligence -->
+            <div class="mt-8">
+                <div class="card overflow-hidden">
+                    <div class="card-header flex justify-between items-center">
+                        <h3 class="card-title">Inventory Intelligence & Replenishment</h3>
+                        <div class="text-xs text-muted">Auto-calculated based on 7-day forecast</div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left" id="inventoryTable">
+                            <thead class="bg-slate-800/50 text-xs font-bold text-muted uppercase tracking-wider">
+                                <tr>
+                                    <th class="p-4 border-b border-slate-700">Product</th>
+                                    <th class="p-4 border-b border-slate-700">Category</th>
+                                    <th class="p-4 border-b border-slate-700">Stock</th>
+                                    <th class="p-4 border-b border-slate-700">7D Forecast</th>
+                                    <th class="p-4 border-b border-slate-700">Cover (Days)</th>
+                                    <th class="p-4 border-b border-slate-700">Status</th>
+                                    <th class="p-4 border-b border-slate-700">Recommendation</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-sm">
+                                <!-- Populated by JS -->
+                                <tr>
+                                    <td colspan="7" class="p-8 text-center text-muted">Please select a location above to
+                                        load intelligence data.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
         </main>
+
+        <!-- Product Catalog Search Modal -->
+        <div id="catalogModal" class="modal-overlay hidden">
+            <div class="modal-container">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-xl font-bold">Product Catalog Finder</h2>
+                    <button id="closeCatalog" class="text-muted hover:text-white">&times;</button>
+                </div>
+
+                <div class="flex flex-col md:flex-row gap-4 mb-6">
+                    <div class="flex-1 relative">
+                        <input type="text" id="catalogSearch" class="form-input pl-10"
+                            placeholder="Search by name, brand or ID...">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            class="absolute left-3 top-3 text-muted">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                        </svg>
+                    </div>
+                    <select id="catalogCategory" class="form-select w-full md:w-48">
+                        <option value="All">All Categories</option>
+                    </select>
+                </div>
+
+                <div id="catalogGrid"
+                    class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 max-h-[60vh] overflow-y-auto pr-2">
+                    <!-- Cards populated by JS -->
+                    <div class="col-span-full py-12 text-center text-muted">Start typing above to find products...</div>
+                </div>
+            </div>
+        </div>
 
         <style>
             .status-dot {

@@ -13,15 +13,23 @@ Endpoints:
 """
 
 import os
+import logging
+import sqlite3
+import asyncio
+import httpx
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # CONFIGURATION
@@ -61,6 +69,20 @@ class Location(BaseModel):
 
 class ProductSearchResponse(BaseModel):
     products: List[Product]
+
+class InventoryTableItem(BaseModel):
+    sku_id: str
+    name: str
+    category: str
+    brand: str
+    stock: int
+    forecast_7d: int
+    days_of_cover: float
+    status: str
+    recommendation: str
+
+class InventoryDashboardResponse(BaseModel):
+    items: List[InventoryTableItem]
 
 class LocationSearchResponse(BaseModel):
     locations: List[Location]
@@ -175,9 +197,92 @@ def load_data():
                 models[h] = lgb.Booster(model_file=str(baseline_path))
                 print(f"Loaded baseline for h={h} (fallback)")
 
+# =============================================================================
+# SERVICES
+# =============================================================================
+
+DB_PATH = "inventory.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+class Simulator:
+    def __init__(self):
+        self.running = False
+        self.task = None
+
+    async def start(self):
+        if self.running: return
+        self.running = True
+        self.task = asyncio.create_task(self._loop())
+        logger.info("Simulator started")
+
+    async def stop(self):
+        self.running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        self.task = None
+        logger.info("Simulator stopped")
+
+    async def _loop(self):
+        while self.running:
+            try:
+                # Logic to decrement stock
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    # Process a BATCH of sales (e.g. 10 changes per tick) for higher activity
+                    batch_size = 10
+                    cursor.execute(f"SELECT sku_id, location_id, current_stock FROM inventory WHERE current_stock > 5 ORDER BY RANDOM() LIMIT {batch_size}")
+                    rows = cursor.fetchall()
+                    
+                    changes = 0
+                    for row in rows:
+                        sku, loc, stock = row
+                        qty = np.random.randint(1, 5)
+                        new_stock = max(0, stock - qty)
+                        cursor.execute("UPDATE inventory SET current_stock = ?, last_updated = CURRENT_TIMESTAMP WHERE sku_id = ? AND location_id = ?", 
+                                       (new_stock, sku, loc))
+                        changes += 1
+                    
+                    conn.commit()
+                    if changes > 0:
+                        logger.info(f"SIMULATOR: Processed {changes} transactions (Demo Mode)")
+                
+                await asyncio.sleep(1.0) # Speed: 1 batch per second
+            except Exception as e:
+                logger.error(f"Simulator error: {e}")
+                await asyncio.sleep(5)
+
+simulator = Simulator()
+
+async def get_live_weather(lat: float = 51.5074, lon: float = -0.1278):
+    # Default to London
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current_weather": "true"
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(url, params=params, timeout=2.0)
+            if resp.status_code == 200:
+                return resp.json().get("current_weather", {})
+        except Exception as e:
+            logger.error(f"Weather API error: {e}")
+    return None
+
 @app.on_event("startup")
 async def startup_event():
     load_data()
+    # Auto-start simulator? No, let user control.
+    # await simulator.start()
 
 # =============================================================================
 # ENDPOINTS
@@ -208,21 +313,25 @@ async def get_locations():
     return LocationSearchResponse(locations=locations)
 
 @app.get("/products", response_model=ProductSearchResponse)
-async def search_products(query: str = ""):
-    """Search for products by name or ID."""
+async def search_products(query: str = "", category: Optional[str] = None):
+    """Search for products by name, ID, or category."""
     if sku_master_df is None:
         raise HTTPException(status_code=503, detail="Product data not available")
     
     df = sku_master_df
+    mask = pd.Series([True] * len(df))
+    
     if query:
         # Case-insensitive search in name or ID
-        mask = (
+        mask = mask & (
             df['sku_name'].str.contains(query, case=False, na=False) | 
             df['sku_id'].str.contains(query, case=False, na=False)
         )
-        results = df[mask].head(20)  # Limit results
-    else:
-        results = df.head(20)
+    
+    if category and category != "All":
+        mask = mask & (df['category'] == category)
+        
+    results = df[mask].head(50)  # Increased limit for rich search
         
     products = []
     for _, row in results.iterrows():
@@ -235,6 +344,71 @@ async def search_products(query: str = ""):
     
     return ProductSearchResponse(products=products)
 
+@app.get("/categories")
+async def get_categories():
+    """Get all unique product categories."""
+    if sku_master_df is None:
+        return {"categories": ["All"]}
+    cats = sku_master_df['category'].unique().tolist()
+    return {"categories": ["All"] + sorted(cats)}
+
+@app.get("/inventory/dashboard", response_model=InventoryDashboardResponse)
+async def get_inventory_dashboard(location_id: str):
+    """Unified table for Item, Stock, Forecast, and Recommendations."""
+    if sku_master_df is None:
+        raise HTTPException(status_code=503, detail="Product data not available")
+    
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT sku_id, current_stock FROM inventory WHERE location_id=?", (location_id,))
+        inventory_rows = {row['sku_id']: row['current_stock'] for row in cursor.fetchall()}
+        conn.close()
+        
+        items = []
+        # Process top 50 products for the dashboard (limit to top 50 for UI performance)
+        for _, row in sku_master_df.head(50).iterrows():
+            sku_id = row['sku_id']
+            stock = inventory_rows.get(sku_id, 0)
+            
+            # Heuristic Forecast (Simulated for speed in dashboard view)
+            # In a real system, this would call the LGBM model in batch
+            # We base it roughly on sku_id to be deterministic for this location
+            # Using basic stats: mean ~100 units/week
+            seed_val = int(sku_id.split('_')[1])
+            np.random.seed(seed_val) 
+            forecast_7d = int(np.random.normal(105, 25)) 
+            
+            daily_demand = forecast_7d / 7
+            days_of_cover = round(stock / daily_demand, 1) if daily_demand > 0 else 99.0
+            
+            status = "Healthy"
+            recommendation = "No action needed"
+            
+            if days_of_cover < 3:
+                status = "Critical"
+                recommendation = f"Restock {forecast_7d * 2} units ASAP"
+            elif days_of_cover < 7:
+                status = "Warning"
+                recommendation = f"Reorder {forecast_7d} units"
+            
+            items.append(InventoryTableItem(
+                sku_id=sku_id,
+                name=row['sku_name'],
+                category=row['category'],
+                brand=row['brand'],
+                stock=stock,
+                forecast_7d=forecast_7d,
+                days_of_cover=days_of_cover,
+                status=status,
+                recommendation=recommendation
+            ))
+            
+        return InventoryDashboardResponse(items=items)
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
@@ -245,14 +419,30 @@ async def health_check():
         "feature_count": len(feature_cols)
     }
 
-def get_mock_inventory(sku_id: str, location_id: str, date: str) -> int:
-    """Simulate inventory levels for demo purposes."""
-    # Deterministic seed based on input so it's consistent for the same query
-    seed_str = f"{sku_id}{location_id}{date}"
-    seed = sum(ord(c) for c in seed_str)
-    np.random.seed(seed)
-    # Return random stock between 0 and 500
-    return int(np.random.randint(50, 500))
+@app.post("/simulate/start")
+async def start_simulation():
+    await simulator.start()
+    return {"status": "started", "message": "Buying Simulator active. Inventory will deplete."}
+
+@app.post("/simulate/stop")
+async def stop_simulation():
+    await simulator.stop()
+    return {"status": "stopped", "message": "Buying Simulator stopped."}
+
+@app.get("/inventory/status")
+async def get_inventory_status(sku_id: str, location_id: str):
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT current_stock FROM inventory WHERE sku_id=? AND location_id=?", (sku_id, location_id))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {"current_stock": row[0]}
+        return {"current_stock": 0}
+    except Exception as e:
+        logger.error(f"DB Error: {e}")
+        return {"current_stock": 0}
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
@@ -266,13 +456,33 @@ async def predict(request: PredictionRequest):
         )
     
     try:
-        # 1. Base Prediction (Simplified)
-        # In prod, this calls models[request.horizon].predict(features)
-        feature_count = len(feature_cols)
-        # Dummy prediction simulating model output
+        # 1. Fetch Real-Time Data (Digital Twin)
+        # Inventory
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT current_stock FROM inventory WHERE sku_id=? AND location_id=?", 
+                      (request.sku_id, request.location_id))
+        row = cursor.fetchone()
+        conn.close()
+        current_stock = row[0] if row else 0
+        
+        # Weather
+        # ideally lookup lat/lon from location_master_df
+        weather = await get_live_weather(51.5, -0.1) # London
+        
+        # 2. Base Prediction (Simplified)
         base_prediction = 150.0  # Baseline
         
-        # 2. Apply Scenario Logic (Heuristics)
+        # 3. Apply Weather Impact (Live Data)
+        weather_impact = 0.0
+        if weather:
+            temp = weather.get('temperature', 10.0)
+            if temp > 20:
+                weather_impact = base_prediction * 0.15 # Hot weather boost
+            elif temp < 5:
+                weather_impact = base_prediction * 0.05 # Cold weather boost
+        
+        # 4. Apply Scenario Logic (Heuristics)
         # Price Elasticity: Assume -2.0 (10% price drop -> 20% demand incr)
         price_impact = 0.0
         if request.price_change_pct != 0:
@@ -285,7 +495,7 @@ async def predict(request: PredictionRequest):
         if request.is_promo:
             promo_impact = base_prediction * 0.30
             
-        final_prediction = base_prediction + price_impact + promo_impact
+        final_prediction = base_prediction + weather_impact + price_impact + promo_impact
         final_prediction = max(0, final_prediction) # No negative demand
         
         # Calculate impact percentage
@@ -293,9 +503,6 @@ async def predict(request: PredictionRequest):
         if base_prediction > 0:
             scenario_impact_pct = ((final_prediction - base_prediction) / base_prediction) * 100
 
-        # 3. Inventory Logic (Mock)
-        current_stock = get_mock_inventory(request.sku_id, request.location_id, request.date)
-        
         # Status calculation
         stock_status = "Safe"
         if current_stock < final_prediction:
@@ -314,7 +521,7 @@ async def predict(request: PredictionRequest):
         margin = final_prediction * wmape
         conf_min = max(0, final_prediction - margin)
         conf_max = final_prediction + margin
-
+        
         return PredictionResponse(
             sku_id=request.sku_id,
             location_id=request.location_id,
@@ -323,7 +530,7 @@ async def predict(request: PredictionRequest):
             prediction=round(final_prediction, 1),
             confidence_min=round(conf_min, 1),
             confidence_max=round(conf_max, 1),
-            model_version=f"h{request.horizon}_v1.0",
+            model_version=f"h{request.horizon}_v1.0-live",
             current_stock=current_stock,
             stock_status=stock_status,
             days_of_cover=round(days_of_cover, 1),
